@@ -85,6 +85,25 @@ control, or the reverse, gives you a device that answers but carries no audio.
 Reloading the module also needs the adapter's voice setting applied first
 (`hciconfig <dev> voice 0x0060`), otherwise `module load chan_mobile` fails.
 
+## The handoff reconnect is bounded
+
+A peer that accepts the media handoff socket and closes it immediately turns the
+handoff loop into a full-speed spin: connect, log, `POLLHUP`, repeat.  The
+`sleep(1)` in that loop only ever guarded a *failed* connect, so a connect that
+succeeded and then died instantly cost nothing and went straight round again.
+One such loop wrote 2.1 million identical NOTICE lines into the first 200 MB of
+a 2.9 GB log.
+
+A connection that does not survive `MBL_LE_HANDOFF_MIN_LIFETIME` is treated as
+churn and delays the next attempt, doubling to `MBL_LE_HANDOFF_BACKOFF_MAX`; one
+that survives resets the delay, so a single bad patch cannot leave a healthy
+link waiting.  The delay sleeps in one-second steps and rechecks the unload
+flag, so it cannot hold module unload for its whole length.
+
+The connect notice is rate limited to `MBL_LE_HANDOFF_LOG_INTERVAL` and carries
+`reconnects_since_last_notice=N`.  Suppressing silently would hide exactly the
+reconnect storm worth knowing about.
+
 ## Caller ID over the call-control socket
 
 The `lecall` packet is a fixed 128 bytes and carries the caller identity as an

@@ -89,6 +89,24 @@ libc 외에는 런타임 의존성을 갖지 않습니다.
 (`hciconfig <dev> voice 0x0060`). 그러지 않으면 `module load chan_mobile`이
 실패합니다.
 
+## handoff 재연결에는 상한이 있습니다
+
+미디어 handoff 소켓을 accept한 직후 닫는 피어는 handoff 루프를 전속력 회전으로
+바꿉니다. connect → 로그 → `POLLHUP` → 반복입니다. 그 루프의 `sleep(1)`은
+connect *실패*만 막았기 때문에, 성공했다가 즉시 죽는 연결은 아무 대가 없이 곧장
+다시 돌았습니다. 실제로 한 번은 2.9GB 로그의 첫 200MB에 같은 NOTICE 210만 줄이
+쌓였습니다.
+
+`MBL_LE_HANDOFF_MIN_LIFETIME`을 못 넘긴 연결은 churn으로 보고 다음 시도를
+지연시킵니다. 지연은 `MBL_LE_HANDOFF_BACKOFF_MAX`까지 2배씩 늘고, 살아남은
+연결은 지연을 0으로 되돌립니다. 한 번의 불안정이 정상 링크를 붙잡지 않게 하려는
+것입니다. 지연은 1초 단위로 자며 매번 언로드 플래그를 다시 보므로, 지연 전체
+길이만큼 모듈 언로드를 붙잡지 않습니다.
+
+접속 NOTICE는 `MBL_LE_HANDOFF_LOG_INTERVAL`마다 한 줄로 제한하고
+`reconnects_since_last_notice=N`을 함께 싣습니다. 조용히 억제하면 정작 알아야 할
+재연결 폭주가 가려지기 때문입니다.
+
 ## 호출 제어 소켓의 발신자 정보
 
 `lecall` 패킷은 128바이트 고정이고, 발신자 정보는 통화 상태 메시지에 선택

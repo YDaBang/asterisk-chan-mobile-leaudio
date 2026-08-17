@@ -20,7 +20,7 @@ diff --git a/addons/Makefile b/addons/Makefile
 diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
 --- a/addons/chan_mobile.c
 +++ b/addons/chan_mobile.c
-@@ -42,6 +42,8 @@
+@@ -42,8 +42,11 @@
  
  #include "asterisk.h"
  
@@ -28,8 +28,11 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
 +#include <poll.h>
  #include <pthread.h>
  #include <signal.h>
++#include <time.h>
  
-@@ -54,6 +56,10 @@
+ #include <bluetooth/bluetooth.h>
+ #include <bluetooth/hci.h>
+@@ -54,6 +57,10 @@
  #include <bluetooth/sco.h>
  #include <bluetooth/l2cap.h>
  
@@ -40,7 +43,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  #include "asterisk/compat.h"
  #include "asterisk/lock.h"
  #include "asterisk/callerid.h"
-@@ -78,15 +84,97 @@
+@@ -78,15 +85,111 @@
  #define MBL_CONFIG "chan_mobile.conf"
  #define MBL_CONFIG_OLD "mobile.conf"
  
@@ -55,6 +58,20 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
 +#define MBL_LE_AUDIO_SOCKET_DEFAULT "/run/asterisk-leaudio/leaudio.sock"
 +#define MBL_LE_AUDIO_SOCKET_MAX 107
 +#define MBL_LE_CALL_SOCKET_DEFAULT "/run/asterisk-leaudio/lecall.sock"
++
++/* A peer that accepts the handoff socket and closes it immediately turns the
++ * handoff loop into a reconnect spin: connect, log, POLLHUP, repeat, with
++ * nothing anywhere to slow it down.  One such loop wrote 2.1 million identical
++ * NOTICE lines into the first 200 MB of a 2.9 GB log.
++ *
++ * A connection that does not survive MIN_LIFETIME is treated as churn and
++ * delays the next attempt; one that does resets the delay, so a single bad
++ * patch cannot leave a healthy link waiting.  The connect notice is rate
++ * limited and carries how many it stands for, because a silent suppression
++ * would hide exactly the reconnect storm worth knowing about. */
++#define MBL_LE_HANDOFF_MIN_LIFETIME 5
++#define MBL_LE_HANDOFF_BACKOFF_MAX 30
++#define MBL_LE_HANDOFF_LOG_INTERVAL 60
 +
 +#define HFP_CODEC_CVSD 1
 +#define HFP_CODEC_MSBC 2
@@ -141,7 +158,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  static int unloading_flag = 0;
  static inline int check_unloading(void);
  static inline void set_unloading(void);
-@@ -108,6 +196,11 @@ struct adapter_pvt {
+@@ -108,6 +211,11 @@ struct adapter_pvt {
  	int *sco_id;					/*!< the io context id of the sco listener socket */
  	int sco_socket;					/*!< sco listener socket */
  	pthread_t sco_listener_thread;			/*!< sco listener thread */
@@ -153,7 +170,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	AST_LIST_ENTRY(adapter_pvt) entry;
  };
  
-@@ -131,10 +224,51 @@ struct mbl_pvt {
+@@ -131,10 +239,51 @@ struct mbl_pvt {
  	int rfcomm_port;				/* rfcomm port number */
  	int rfcomm_socket;				/* rfcomm socket descriptor */
  	char rfcomm_buf[256];
@@ -206,7 +223,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	pthread_t monitor_thread;			/* monitor thread handle */
  	int timeout;					/*!< used to set the timeout for rfcomm data (may be used in the future) */
  	unsigned int no_callsetup:1;
-@@ -159,6 +293,7 @@ struct mbl_pvt {
+@@ -159,6 +308,7 @@ struct mbl_pvt {
  	unsigned int needring:1;	/*!< we need to send a RING */
  	unsigned int answered:1;	/*!< we sent/received an answer */
  	unsigned int connected:1;	/*!< do we have an rfcomm connection to a device */
@@ -214,7 +231,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  	AST_LIST_ENTRY(mbl_pvt) entry;
  };
-@@ -215,7 +350,8 @@ static char *mblsendsms_desc =
+@@ -215,7 +365,8 @@ static char *mblsendsms_desc =
  "  Message - text of the message\n";
  
  static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinfo *cidinfo,
@@ -224,7 +241,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *cap,
  		const struct ast_assigned_ids *assignedids, const struct ast_channel *requestor, const char *data, int *cause);
  static int mbl_call(struct ast_channel *ast, const char *dest, int timeout);
-@@ -233,6 +369,18 @@ static int mbl_queue_control(struct mbl_pvt *pvt, enum ast_control_frame_type co
+@@ -233,6 +384,18 @@ static int mbl_queue_control(struct mbl_pvt *pvt, enum ast_control_frame_type co
  static int mbl_queue_hangup(struct mbl_pvt *pvt);
  static int mbl_ast_hangup(struct mbl_pvt *pvt);
  static int mbl_has_service(struct mbl_pvt *pvt);
@@ -243,7 +260,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  static int rfcomm_connect(bdaddr_t src, bdaddr_t dst, int remote_channel);
  static int rfcomm_write(int rsock, char *buf);
-@@ -244,6 +392,8 @@ static int sco_connect(bdaddr_t src, bdaddr_t dst);
+@@ -244,6 +407,8 @@ static int sco_connect(bdaddr_t src, bdaddr_t dst);
  static int sco_write(int s, char *buf, int len);
  static int sco_accept(int *id, int fd, short events, void *data);
  static int sco_bind(struct adapter_pvt *adapter);
@@ -252,7 +269,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  static void *do_sco_listen(void *data);
  static int sdp_search(char *addr, int profile);
-@@ -261,6 +411,8 @@ static int headset_send_ring(const void *data);
+@@ -261,6 +426,8 @@ static int headset_send_ring(const void *data);
  #define HFP_HF_VOLUME	(1 << 4)
  #define HFP_HF_STATUS	(1 << 5)
  #define HFP_HF_CONTROL	(1 << 6)
@@ -261,7 +278,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  #define HFP_AG_CW	(1 << 0)
  #define HFP_AG_ECNR	(1 << 1)
-@@ -271,6 +423,8 @@ static int headset_send_ring(const void *data);
+@@ -271,6 +438,8 @@ static int headset_send_ring(const void *data);
  #define HFP_AG_STATUS	(1 << 6)
  #define HFP_AG_CONTROL	(1 << 7)
  #define HFP_AG_ERRORS	(1 << 8)
@@ -270,7 +287,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  #define HFP_CIND_UNKNOWN	-1
  #define HFP_CIND_NONE		0
-@@ -307,6 +461,8 @@ struct hfp_hf {
+@@ -307,6 +476,8 @@ struct hfp_hf {
  	int volume:1;	/*!< remote volume control */
  	int status:1;	/*!< enhanced call status */
  	int control:1;	/*!< enhanced call control*/
@@ -279,7 +296,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  };
  
  /*!
-@@ -322,6 +478,8 @@ struct hfp_ag {
+@@ -322,6 +493,8 @@ struct hfp_ag {
  	int status:1;	/*!< enhanced call status */
  	int control:1;	/*!< enhanced call control*/
  	int errors:1;	/*!< extended error result codes*/
@@ -288,7 +305,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  };
  
  /*!
-@@ -366,6 +524,8 @@ static struct hfp_hf hfp_our_brsf = {
+@@ -366,6 +539,8 @@ static struct hfp_hf hfp_our_brsf = {
  	.volume = 0,
  	.status = 0,
  	.control = 0,
@@ -297,7 +314,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  };
  
  
-@@ -375,6 +535,7 @@ static int parse_next_token(char string[], const int start, const char delim);
+@@ -375,6 +550,7 @@ static int parse_next_token(char string[], const int start, const char delim);
  static int hfp_parse_cmti(struct hfp_pvt *hfp, char *buf);
  static int hfp_parse_cmgr(struct hfp_pvt *hfp, char *buf, char **from_number, char **text);
  static int hfp_parse_brsf(struct hfp_pvt *hfp, const char *buf);
@@ -305,7 +322,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  static int hfp_parse_cind(struct hfp_pvt *hfp, char *buf);
  static int hfp_parse_cind_test(struct hfp_pvt *hfp, char *buf);
  static char *hfp_parse_cusd(struct hfp_pvt *hfp, char *buf);
-@@ -383,6 +544,8 @@ static int hfp_brsf2int(struct hfp_hf *hf);
+@@ -383,6 +559,8 @@ static int hfp_brsf2int(struct hfp_hf *hf);
  static struct hfp_ag *hfp_int2brsf(int brsf, struct hfp_ag *ag);
  
  static int hfp_send_brsf(struct hfp_pvt *hfp, struct hfp_hf *brsf);
@@ -314,7 +331,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  static int hfp_send_cind(struct hfp_pvt *hfp);
  static int hfp_send_cind_test(struct hfp_pvt *hfp);
  static int hfp_send_cmer(struct hfp_pvt *hfp, int status);
-@@ -426,6 +589,7 @@ typedef enum {
+@@ -426,6 +604,7 @@ typedef enum {
  	AT_ERROR,
  	AT_RING,
  	AT_BRSF,
@@ -322,7 +339,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	AT_CIND,
  	AT_CIEV,
  	AT_CLIP,
-@@ -445,6 +609,7 @@ typedef enum {
+@@ -445,6 +624,7 @@ typedef enum {
  	AT_CMGF,
  	AT_CNMI,
  	AT_CMER,
@@ -330,7 +347,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	AT_CIND_TEST,
  	AT_CUSD,
  	AT_BUSY,
-@@ -517,16 +682,29 @@ static char *handle_cli_mobile_show_devices(struct ast_cli_entry *e, int cmd, st
+@@ -517,16 +697,29 @@ static char *handle_cli_mobile_show_devices(struct ast_cli_entry *e, int cmd, st
  	ast_cli(a->fd, FORMAT1, "ID", "Address", "Group", "Adapter", "Connected", "State", "SMS");
  	AST_RWLIST_RDLOCK(&devices);
  	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
@@ -363,7 +380,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  				(pvt->has_sms) ? "Yes" : "No"
  		       );
  		ast_mutex_unlock(&pvt->lock);
-@@ -746,7 +924,7 @@ static int mbl_status_exec(struct ast_channel *ast, const char *data)
+@@ -746,7 +939,7 @@ static int mbl_status_exec(struct ast_channel *ast, const char *data)
  
  	if (pvt) {
  		ast_mutex_lock(&pvt->lock);
@@ -372,7 +389,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  			stat = 2;
  		if (pvt->owner)
  			stat = 3;
-@@ -844,12 +1022,468 @@ e_return:
+@@ -844,12 +1037,468 @@ e_return:
  
  */
  
@@ -842,7 +859,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	pvt->alignment_count = 0;
  	pvt->alignment_detection_triggered = 0;
  	if (pvt->adapter->alignment_detection)
-@@ -857,8 +1491,65 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
+@@ -857,8 +1506,65 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
  	else
  		pvt->do_alignment_detection = 0;
  
@@ -910,7 +927,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	ast_dsp_digitreset(pvt->dsp);
  
  	chn = ast_channel_alloc(1, state,
-@@ -870,12 +1561,18 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
+@@ -870,12 +1576,18 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
  		goto e_return;
  	}
  
@@ -934,7 +951,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	ast_channel_tech_pvt_set(chn, pvt);
  
  	if (state == AST_STATE_RING)
-@@ -883,8 +1580,23 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
+@@ -883,8 +1595,23 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
  
  	ast_channel_language_set(chn, "en");
  	pvt->owner = chn;
@@ -959,7 +976,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		ast_channel_set_fd(chn, 0, pvt->sco_socket);
  	}
  	ast_channel_unlock(chn);
-@@ -892,6 +1604,10 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
+@@ -892,6 +1619,10 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
  	return chn;
  
  e_return:
@@ -970,7 +987,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	return NULL;
  }
  
-@@ -911,7 +1627,10 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
+@@ -911,7 +1642,10 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
  		return NULL;
  	}
  
@@ -982,7 +999,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		struct ast_str *codec_buf = ast_str_alloca(AST_FORMAT_CAP_NAMES_LEN);
  		ast_log(LOG_WARNING, "Asked to get a channel of unsupported format '%s'\n", ast_format_cap_get_names(cap, &codec_buf));
  		*cause = AST_CAUSE_FACILITY_NOT_IMPLEMENTED;
-@@ -931,8 +1650,12 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
+@@ -931,8 +1665,12 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
  	/* Find requested device and make sure it's connected. */
  	AST_RWLIST_RDLOCK(&devices);
  	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
@@ -997,7 +1014,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  				continue;
  			}
  
-@@ -942,7 +1665,9 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
+@@ -942,7 +1680,9 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
  		}
  	}
  	AST_RWLIST_UNLOCK(&devices);
@@ -1008,7 +1025,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		ast_log(LOG_WARNING, "Request to call on device %s which is not connected / already in use.\n", dest_dev);
  		*cause = AST_CAUSE_REQUESTED_CHAN_UNAVAIL;
  		return NULL;
-@@ -955,7 +1680,24 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
+@@ -955,7 +1695,24 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
  	}
  
  	ast_mutex_lock(&pvt->lock);
@@ -1034,7 +1051,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	ast_mutex_unlock(&pvt->lock);
  	if (!chn) {
  		ast_log(LOG_WARNING, "Unable to allocate channel structure.\n");
-@@ -995,14 +1737,41 @@ static int mbl_call(struct ast_channel *ast, const char *dest, int timeout)
+@@ -995,14 +1752,41 @@ static int mbl_call(struct ast_channel *ast, const char *dest, int timeout)
  
  	ast_mutex_lock(&pvt->lock);
  	if (pvt->type == MBL_TYPE_PHONE) {
@@ -1083,7 +1100,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	} else {
  		if (hsp_send_ring(pvt->rfcomm_socket)) {
  			ast_log(LOG_ERROR, "[%s] error ringing device\n", pvt->id);
-@@ -1039,18 +1808,57 @@ static int mbl_hangup(struct ast_channel *ast)
+@@ -1039,18 +1823,57 @@ static int mbl_hangup(struct ast_channel *ast)
  	ast_debug(1, "[%s] hanging up device\n", pvt->id);
  
  	ast_mutex_lock(&pvt->lock);
@@ -1144,7 +1161,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	pvt->needring = 0;
  	pvt->owner = NULL;
  	ast_channel_tech_pvt_set(ast, NULL);
-@@ -1075,9 +1883,24 @@ static int mbl_answer(struct ast_channel *ast)
+@@ -1075,9 +1898,24 @@ static int mbl_answer(struct ast_channel *ast)
  
  	ast_mutex_lock(&pvt->lock);
  	if (pvt->incoming) {
@@ -1172,7 +1189,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	}
  	ast_mutex_unlock(&pvt->lock);
  
-@@ -1093,6 +1916,13 @@ static int mbl_digit_end(struct ast_channel *ast, char digit, unsigned int durat
+@@ -1093,6 +1931,13 @@ static int mbl_digit_end(struct ast_channel *ast, char digit, unsigned int durat
  		return 0;
  
  	ast_mutex_lock(&pvt->lock);
@@ -1186,7 +1203,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	if (hfp_send_dtmf(pvt->hfp, digit)) {
  		ast_mutex_unlock(&pvt->lock);
  		ast_debug(1, "[%s] error sending digit %c\n", pvt->id, digit);
-@@ -1106,26 +1936,171 @@ static int mbl_digit_end(struct ast_channel *ast, char digit, unsigned int durat
+@@ -1106,26 +1951,171 @@ static int mbl_digit_end(struct ast_channel *ast, char digit, unsigned int durat
  	return 0;
  }
  
@@ -1361,7 +1378,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	pvt->fr.src = "Mobile";
  	pvt->fr.offset = AST_FRIENDLY_OFFSET;
  	pvt->fr.mallocd = 0;
-@@ -1134,25 +2109,81 @@ static struct ast_frame *mbl_read(struct ast_channel *ast)
+@@ -1134,25 +2124,81 @@ static struct ast_frame *mbl_read(struct ast_channel *ast)
  	pvt->fr.data.ptr = pvt->io_buf + AST_FRIENDLY_OFFSET;
  
  	do {
@@ -1452,7 +1469,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	fr = ast_dsp_process(ast, pvt->dsp, fr);
  
  	ast_mutex_unlock(&pvt->lock);
-@@ -1169,8 +2200,11 @@ static int mbl_write(struct ast_channel *ast, struct ast_frame *frame)
+@@ -1169,8 +2215,11 @@ static int mbl_write(struct ast_channel *ast, struct ast_frame *frame)
  
  	struct mbl_pvt *pvt = ast_channel_tech_pvt(ast);
  	struct ast_frame *f;
@@ -1464,7 +1481,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  	if (frame->frametype != AST_FRAME_VOICE) {
  		return 0;
-@@ -1179,11 +2213,112 @@ static int mbl_write(struct ast_channel *ast, struct ast_frame *frame)
+@@ -1179,11 +2228,112 @@ static int mbl_write(struct ast_channel *ast, struct ast_frame *frame)
  	while (ast_mutex_trylock(&pvt->lock)) {
  		CHANNEL_DEADLOCK_AVOIDANCE(ast);
  	}
@@ -1579,7 +1596,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	}
  
  	ast_mutex_unlock(&pvt->lock);
-@@ -1203,8 +2338,11 @@ static int mbl_fixup(struct ast_channel *oldchan, struct ast_channel *newchan)
+@@ -1203,8 +2353,11 @@ static int mbl_fixup(struct ast_channel *oldchan, struct ast_channel *newchan)
  	}
  
  	ast_mutex_lock(&pvt->lock);
@@ -1592,7 +1609,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	ast_mutex_unlock(&pvt->lock);
  
  	return 0;
-@@ -1233,13 +2371,14 @@ static int mbl_devicestate(const char *data)
+@@ -1233,13 +2386,14 @@ static int mbl_devicestate(const char *data)
  		return res;
  
  	ast_mutex_lock(&pvt->lock);
@@ -1609,7 +1626,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  			res = AST_DEVICE_UNAVAILABLE;
  	}
  	ast_mutex_unlock(&pvt->lock);
-@@ -1871,7 +3010,7 @@ static int sco_connect(bdaddr_t src, bdaddr_t dst)
+@@ -1871,7 +3025,7 @@ static int sco_connect(bdaddr_t src, bdaddr_t dst)
  static int sco_write(int s, char *buf, int len)
  {
  
@@ -1618,7 +1635,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  	if (s == -1) {
  		ast_debug(3, "sco_write() not ready\n");
-@@ -1880,9 +3019,15 @@ static int sco_write(int s, char *buf, int len)
+@@ -1880,9 +3034,15 @@ static int sco_write(int s, char *buf, int len)
  
  	ast_debug(3, "sco_write()\n");
  
@@ -1637,7 +1654,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		return 0;
  	}
  
-@@ -1901,9 +3046,7 @@ static int sco_accept(int *id, int fd, short events, void *data)
+@@ -1901,9 +3061,7 @@ static int sco_accept(int *id, int fd, short events, void *data)
  	struct sockaddr_sco addr;
  	socklen_t addrlen;
  	struct mbl_pvt *pvt;
@@ -1647,7 +1664,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	int sock;
  
  	addrlen = sizeof(struct sockaddr_sco);
-@@ -1912,11 +3055,8 @@ static int sco_accept(int *id, int fd, short events, void *data)
+@@ -1912,11 +3070,8 @@ static int sco_accept(int *id, int fd, short events, void *data)
  		return 0;
  	}
  
@@ -1660,7 +1677,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  	/* figure out which device this sco connection belongs to */
  	pvt = NULL;
-@@ -1933,6 +3073,70 @@ static int sco_accept(int *id, int fd, short events, void *data)
+@@ -1933,6 +3088,70 @@ static int sco_accept(int *id, int fd, short events, void *data)
  	}
  
  	ast_mutex_lock(&pvt->lock);
@@ -1731,7 +1748,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	if (pvt->sco_socket != -1) {
  		close(pvt->sco_socket);
  		pvt->sco_socket = -1;
-@@ -1940,7 +3144,12 @@ static int sco_accept(int *id, int fd, short events, void *data)
+@@ -1940,7 +3159,12 @@ static int sco_accept(int *id, int fd, short events, void *data)
  
  	pvt->sco_socket = sock;
  	if (pvt->owner) {
@@ -1745,7 +1762,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	} else {
  		ast_debug(1, "incoming audio connection for pvt without owner\n");
  	}
-@@ -1964,7 +3173,6 @@ static int sco_bind(struct adapter_pvt *adapter)
+@@ -1964,7 +3188,6 @@ static int sco_bind(struct adapter_pvt *adapter)
  		ast_log(LOG_ERROR, "Unable to create sco listener socket for adapter %s.\n", adapter->id);
  		goto e_return;
  	}
@@ -1753,7 +1770,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	memset(&addr, 0, sizeof(addr));
  	addr.sco_family = AF_BLUETOOTH;
  	bacpy(&addr.sco_bdaddr, &adapter->addr);
-@@ -1972,6 +3180,14 @@ static int sco_bind(struct adapter_pvt *adapter)
+@@ -1972,6 +3195,14 @@ static int sco_bind(struct adapter_pvt *adapter)
  		ast_log(LOG_ERROR, "Unable to bind sco listener socket. (%d)\n", errno);
  		goto e_close_socket;
  	}
@@ -1768,7 +1785,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	if (setsockopt(adapter->sco_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
  		ast_log(LOG_ERROR, "Unable to setsockopt sco listener socket.\n");
  		goto e_close_socket;
-@@ -1990,6 +3206,80 @@ e_return:
+@@ -1990,6 +3221,80 @@ e_return:
  	return -1;
  }
  
@@ -1849,7 +1866,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  /*
   * Hayes AT command helpers.
-@@ -2037,6 +3327,8 @@ static at_message_t at_read_full(int rsock, char *buf, size_t count)
+@@ -2037,6 +3342,8 @@ static at_message_t at_read_full(int rsock, char *buf, size_t count)
  		return AT_CIEV;
  	} else if (at_match_prefix(buf, "+BRSF:")) {
  		return AT_BRSF;
@@ -1858,7 +1875,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	} else if (at_match_prefix(buf, "+CIND:")) {
  		return AT_CIND;
  	} else if (at_match_prefix(buf, "+CLIP:")) {
-@@ -2093,6 +3385,8 @@ static inline const char *at_msg2str(at_message_t msg)
+@@ -2093,6 +3400,8 @@ static inline const char *at_msg2str(at_message_t msg)
  		return "RING";
  	case AT_BRSF:
  		return "AT+BRSF";
@@ -1867,7 +1884,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	case AT_CIND:
  		return "AT+CIND";
  	case AT_CIEV:
-@@ -2136,6 +3430,8 @@ static inline const char *at_msg2str(at_message_t msg)
+@@ -2136,6 +3445,8 @@ static inline const char *at_msg2str(at_message_t msg)
  		return "AT+CNMI";
  	case AT_CMER:
  		return "AT+CMER";
@@ -1876,7 +1893,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	case AT_CIND_TEST:
  		return "AT+CIND=?";
  	case AT_CUSD:
-@@ -2478,6 +3774,8 @@ static int hfp_brsf2int(struct hfp_hf *hf)
+@@ -2478,6 +3789,8 @@ static int hfp_brsf2int(struct hfp_hf *hf)
  	brsf |= hf->volume ? HFP_HF_VOLUME : 0;
  	brsf |= hf->status ? HFP_HF_STATUS : 0;
  	brsf |= hf->control ? HFP_HF_CONTROL : 0;
@@ -1885,7 +1902,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  	return brsf;
  }
-@@ -2500,6 +3798,8 @@ static struct hfp_ag *hfp_int2brsf(int brsf, struct hfp_ag *ag)
+@@ -2500,6 +3813,8 @@ static struct hfp_ag *hfp_int2brsf(int brsf, struct hfp_ag *ag)
  	ag->status = brsf & HFP_AG_STATUS ? 1 : 0;
  	ag->control = brsf & HFP_AG_CONTROL ? 1 : 0;
  	ag->errors = brsf & HFP_AG_ERRORS ? 1 : 0;
@@ -1894,7 +1911,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  	return ag;
  }
-@@ -2520,6 +3820,22 @@ static int hfp_send_brsf(struct hfp_pvt *hfp, struct hfp_hf *brsf)
+@@ -2520,6 +3835,22 @@ static int hfp_send_brsf(struct hfp_pvt *hfp, struct hfp_hf *brsf)
  	return rfcomm_write(hfp->rsock, cmd);
  }
  
@@ -1917,7 +1934,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  /*!
   * \brief Send the CIND read command.
   * \param hfp an hfp_pvt struct
-@@ -2735,6 +4051,13 @@ static int hfp_parse_brsf(struct hfp_pvt *hfp, const char *buf)
+@@ -2735,6 +4066,13 @@ static int hfp_parse_brsf(struct hfp_pvt *hfp, const char *buf)
  	return 0;
  }
  
@@ -1931,7 +1948,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  /*!
   * \brief Parse and store the given indicator.
   * \param hfp an hfp_pvt struct
-@@ -3120,30 +4443,58 @@ static int sdp_search(char *addr, int profile)
+@@ -3120,30 +4458,58 @@ static int sdp_search(char *addr, int profile)
  
  static sdp_session_t *sdp_register(void)
  {
@@ -1995,7 +2012,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	sdp_uuid16_create(&root_uuid, PUBLIC_BROWSE_GROUP);
  	root_list = sdp_list_append(0, &root_uuid);
  	sdp_set_browse_groups( record, root_list );
-@@ -3177,6 +4528,7 @@ static sdp_session_t *sdp_register(void)
+@@ -3177,6 +4543,7 @@ static sdp_session_t *sdp_register(void)
  	sdp_list_free(root_list, 0);
  	sdp_list_free(access_proto_list, 0);
  	sdp_list_free(svc_uuid_list, 0);
@@ -2003,7 +2020,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  	return session;
  
-@@ -3203,6 +4555,9 @@ static int handle_response_brsf(struct mbl_pvt *pvt, char *buf)
+@@ -3203,6 +4570,9 @@ static int handle_response_brsf(struct mbl_pvt *pvt, char *buf)
  			ast_debug(1, "[%s] error parsing BRSF\n", pvt->id);
  			goto e_return;
  		}
@@ -2013,21 +2030,10 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  		if (msg_queue_push(pvt, AT_OK, AT_BRSF)) {
  			ast_debug(1, "[%s] error handling BRSF\n", pvt->id);
-@@ -3213,14 +4568,93 @@ static int handle_response_brsf(struct mbl_pvt *pvt, char *buf)
- 	} else if (entry) {
- 		ast_debug(1, "[%s] received unexpected AT message 'BRSF' when expecting %s, ignoring\n", pvt->id, at_msg2str(entry->expected));
- 	} else {
--		ast_debug(1, "[%s] received unexpected AT message 'BRSF'\n", pvt->id);
-+		ast_debug(1, "[%s] received unexpected AT message 'BRSF'\n", pvt->id);
-+	}
-+
-+	return 0;
-+
-+e_return:
-+	msg_queue_free_and_pop(pvt);
-+	return -1;
-+}
-+
+@@ -3223,6 +4593,85 @@ e_return:
+ 	return -1;
+ }
+ 
 +static int hfp_continue_slc_after_codec_setup(struct mbl_pvt *pvt)
 +{
 +	/* If this is a blackberry do CMER now, otherwise continue with CIND. */
@@ -2099,20 +2105,18 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
 +			msg_queue_push(pvt, AT_OK, AT_BAC))
 +			return -1;
 +		return 0;
- 	}
- 
++	}
++
 +	if (hfp_send_bcs(pvt->hfp, codec) ||
 +		msg_queue_push(pvt, AT_OK, AT_BCS))
 +		return -1;
- 	return 0;
--
--e_return:
--	msg_queue_free_and_pop(pvt);
--	return -1;
- }
- 
++	return 0;
++}
++
  /*!
-@@ -3281,21 +4715,34 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
+  * \brief Handle the CIND response.
+  * \param pvt a mbl_pvt structure
+@@ -3281,21 +4730,34 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
  		/* initialization stuff */
  		case AT_BRSF:
  			ast_debug(1, "[%s] BSRF sent successfully\n", pvt->id);
@@ -2156,7 +2160,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		case AT_CIND_TEST:
  			ast_debug(1, "[%s] CIND test sent successfully\n", pvt->id);
  
-@@ -3456,6 +4903,28 @@ static int handle_response_error(struct mbl_pvt *pvt, char *buf)
+@@ -3456,6 +4918,28 @@ static int handle_response_error(struct mbl_pvt *pvt, char *buf)
  		case AT_BRSF:
  			ast_debug(1, "[%s] error reading BSRF\n", pvt->id);
  			goto e_return;
@@ -2185,7 +2189,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		case AT_CIND_TEST:
  			ast_debug(1, "[%s] error during CIND test\n", pvt->id);
  			goto e_return;
-@@ -3581,6 +5050,7 @@ static int handle_response_ciev(struct mbl_pvt *pvt, char *buf)
+@@ -3581,6 +5065,7 @@ static int handle_response_ciev(struct mbl_pvt *pvt, char *buf)
  		case HFP_CIND_CALL_ACTIVE:
  			if (pvt->outgoing) {
  				ast_debug(1, "[%s] remote end answered\n", pvt->id);
@@ -2193,7 +2197,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  				mbl_queue_control(pvt, AST_CONTROL_ANSWER);
  			} else if (pvt->incoming && pvt->answered) {
  				ast_setstate(pvt->owner, AST_STATE_UP);
-@@ -3662,12 +5132,13 @@ static int handle_response_clip(struct mbl_pvt *pvt, char *buf)
+@@ -3662,12 +5147,13 @@ static int handle_response_clip(struct mbl_pvt *pvt, char *buf)
  		pvt->needcallerid = 0;
  		cidinfo = hfp_parse_clip(pvt->hfp, buf);
  
@@ -2208,7 +2212,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  		/* from this point on, we need to send a chup in the event of a
  		 * hangup */
-@@ -3752,7 +5223,7 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
+@@ -3752,7 +5238,7 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
  		pvt->incoming_sms = 0;
  
  		/* XXX this channel probably does not need to be associated with this pvt */
@@ -2217,7 +2221,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  			ast_debug(1, "[%s] error creating sms message channel, disconnecting\n", pvt->id);
  			return -1;
  		}
-@@ -3873,6 +5344,7 @@ static void *do_monitor_phone(void *data)
+@@ -3873,6 +5359,7 @@ static void *do_monitor_phone(void *data)
  {
  	struct mbl_pvt *pvt = (struct mbl_pvt *)data;
  	struct hfp_pvt *hfp = pvt->hfp;
@@ -2225,7 +2229,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	char buf[350];
  	int t;
  	at_message_t at_msg;
-@@ -3886,8 +5358,15 @@ static void *do_monitor_phone(void *data)
+@@ -3886,8 +5373,15 @@ static void *do_monitor_phone(void *data)
  
  	/* start initialization with the BRSF request */
  	ast_mutex_lock(&pvt->lock);
@@ -2242,7 +2246,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		ast_debug(1, "[%s] error sending BRSF\n", hfp->owner->id);
  		goto e_cleanup;
  	}
-@@ -3942,6 +5421,14 @@ static void *do_monitor_phone(void *data)
+@@ -3942,6 +5436,14 @@ static void *do_monitor_phone(void *data)
  			}
  			ast_mutex_unlock(&pvt->lock);
  			break;
@@ -2257,7 +2261,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		case AT_CIND:
  			ast_mutex_lock(&pvt->lock);
  			if (handle_response_cind(pvt, buf)) {
-@@ -4077,6 +5564,7 @@ e_cleanup:
+@@ -4077,6 +5579,7 @@ e_cleanup:
  		ast_verb(3, "Error initializing Bluetooth device %s.\n", pvt->id);
  
  	ast_mutex_lock(&pvt->lock);
@@ -2265,7 +2269,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	if (pvt->owner) {
  		ast_debug(1, "[%s] device disconnected, hanging up owner\n", pvt->id);
  		pvt->needchup = 0;
-@@ -4204,7 +5692,7 @@ static void *do_monitor_headset(void *data)
+@@ -4204,7 +5707,7 @@ static void *do_monitor_headset(void *data)
  
  				pvt->incoming = 1;
  
@@ -2274,7 +2278,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  					ast_log(LOG_ERROR, "[%s] unable to allocate channel for incoming call\n", pvt->id);
  					ast_mutex_unlock(&pvt->lock);
  					goto e_cleanup;
-@@ -4294,7 +5782,9 @@ static void *do_discovery(void *data)
+@@ -4294,7 +5797,9 @@ static void *do_discovery(void *data)
  				AST_RWLIST_RDLOCK(&devices);
  				AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
  					ast_mutex_lock(&pvt->lock);
@@ -2285,7 +2289,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  						if ((pvt->rfcomm_socket = rfcomm_connect(adapter->addr, pvt->addr, pvt->rfcomm_port)) > -1) {
  							if (start_monitor(pvt)) {
  								pvt->connected = 1;
-@@ -4347,6 +5837,602 @@ static void *do_sco_listen(void *data)
+@@ -4347,6 +5852,655 @@ static void *do_sco_listen(void *data)
  	return NULL;
  }
  
@@ -2386,9 +2390,41 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
 +	mbl_leaudio_reset_staged_all();
 +}
 +
++/* Sleeps in one-second steps so a backoff cannot hold up module unload for its
++ * whole length.  Returns non-zero if unloading interrupted the wait. */
++static int mbl_leaudio_handoff_wait(unsigned int seconds)
++{
++	while (seconds-- > 0) {
++		if (check_unloading())
++			return 1;
++		sleep(1);
++	}
++	return check_unloading();
++}
++
++/* Drops the handoff link and decides what the next attempt has to wait. */
++static void mbl_leaudio_handoff_dropped(int *handoff_fd, time_t connected_at,
++	unsigned int *backoff)
++{
++	time_t lived = connected_at > 0 ? time(NULL) - connected_at : 0;
++
++	mbl_leaudio_disconnect(handoff_fd);
++	if (lived >= MBL_LE_HANDOFF_MIN_LIFETIME) {
++		*backoff = 0;
++		return;
++	}
++	*backoff = *backoff == 0 ? 1 : *backoff * 2;
++	if (*backoff > MBL_LE_HANDOFF_BACKOFF_MAX)
++		*backoff = MBL_LE_HANDOFF_BACKOFF_MAX;
++}
++
 +static void *do_leaudio_handoff(void *data)
 +{
 +	int handoff_fd = -1;
++	time_t connected_at = 0;
++	time_t reported_at = 0;
++	unsigned int suppressed = 0;
++	unsigned int backoff = 0;
 +
 +	(void) data;
 +	while (!check_unloading()) {
@@ -2396,13 +2432,31 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
 +		int ready;
 +
 +		if (handoff_fd < 0) {
++			time_t now;
++
++			if (backoff > 0 && mbl_leaudio_handoff_wait(backoff))
++				break;
 +			handoff_fd = cm_le_handoff_connect(leaudio_socket_path);
 +			if (handoff_fd < 0) {
 +				sleep(1);
 +				continue;
 +			}
-+			ast_log(LOG_NOTICE,
-+				"LE Audio handoff connected policy=le-canary\n");
++			now = time(NULL);
++			connected_at = now;
++			if (reported_at == 0 ||
++				now - reported_at >= MBL_LE_HANDOFF_LOG_INTERVAL) {
++				if (suppressed > 0)
++					ast_log(LOG_NOTICE,
++						"LE Audio handoff connected policy=le-canary "
++						"reconnects_since_last_notice=%u\n", suppressed);
++				else
++					ast_log(LOG_NOTICE,
++						"LE Audio handoff connected policy=le-canary\n");
++				reported_at = now;
++				suppressed = 0;
++			} else {
++				suppressed++;
++			}
 +		}
 +		memset(&wait_fd, 0, sizeof(wait_fd));
 +		wait_fd.fd = handoff_fd;
@@ -2411,7 +2465,8 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
 +		if (ready < 0) {
 +			if (errno == EINTR)
 +				continue;
-+			mbl_leaudio_disconnect(&handoff_fd);
++			mbl_leaudio_handoff_dropped(&handoff_fd, connected_at,
++				&backoff);
 +			continue;
 +		}
 +		if (ready == 0)
@@ -2427,7 +2482,8 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
 +				if (result == -EAGAIN || result == -EWOULDBLOCK)
 +					break;
 +				if (result < 0) {
-+					mbl_leaudio_disconnect(&handoff_fd);
++					mbl_leaudio_handoff_dropped(&handoff_fd,
++						connected_at, &backoff);
 +					break;
 +				}
 +				mbl_leaudio_dispatch(&descriptor, media_fd, lifecycle_fd);
@@ -2435,7 +2491,8 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
 +		}
 +		if (handoff_fd >= 0 &&
 +			(wait_fd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
-+			mbl_leaudio_disconnect(&handoff_fd);
++			mbl_leaudio_handoff_dropped(&handoff_fd, connected_at,
++				&backoff);
 +		}
 +	}
 +	mbl_leaudio_disconnect(&handoff_fd);
@@ -2888,7 +2945,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  /*
  
  	Module
-@@ -4366,9 +6452,14 @@ static void *do_sco_listen(void *data)
+@@ -4366,9 +6520,14 @@ static void *do_sco_listen(void *data)
  static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *cat)
  {
  	const char *id, *address;
@@ -2903,7 +2960,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	uint16_t vs;
  
  	id = ast_variable_retrieve(cfg, cat, "id");
-@@ -4389,6 +6480,28 @@ static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *
+@@ -4389,6 +6548,28 @@ static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *
  	ast_copy_string(adapter->id, id, sizeof(adapter->id));
  	str2ba(address, &adapter->addr);
  
@@ -2932,7 +2989,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	/* attempt to connect to the adapter */
  	adapter->dev_id = hci_devid(address);
  	adapter->hci_socket = hci_open_dev(adapter->dev_id);
-@@ -4397,8 +6510,39 @@ static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *
+@@ -4397,8 +6578,39 @@ static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *
  		goto e_free_adapter;
  	}
  
@@ -2973,7 +3030,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	vs = htobs(vs);
  	if (vs != 0x0060) {
  		ast_log(LOG_ERROR, "Skipping adapter %s. Voice setting must be 0x0060 - see 'man hciconfig' for details.\n", adapter->id);
-@@ -4524,6 +6668,12 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
+@@ -4524,6 +6736,12 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
  	/* set some defaults */
  
  	pvt->type = MBL_TYPE_PHONE;
@@ -2986,7 +3043,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	ast_copy_string(pvt->context, "default", sizeof(pvt->context));
  
  	/* populate the pvt structure */
-@@ -4539,13 +6689,13 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
+@@ -4539,13 +6757,13 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
  	pvt->has_sms = 1;
  
  	/* setup the bt_out_smoother */
@@ -3002,7 +3059,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		ast_log(LOG_ERROR, "Skipping device %s. Error setting up frame bt_in_smoother.\n", cat);
  		goto e_free_bt_out_smoother;
  	}
-@@ -4578,6 +6728,24 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
+@@ -4578,6 +6796,24 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
  			pvt->group = atoi(v->value);
  		} else if (!strcasecmp(v->name, "sms")) {
  			pvt->has_sms = ast_true(v->value);
@@ -3027,7 +3084,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		} else if (!strcasecmp(v->name, "nocallsetup")) {
  			pvt->no_callsetup = ast_true(v->value);
  
-@@ -4588,6 +6756,56 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
+@@ -4588,6 +6824,56 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
  			pvt->has_sms = 0;
  		}
  	}
@@ -3084,7 +3141,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  	if (pvt->type == MBL_TYPE_PHONE) {
  		if (!(pvt->hfp = ast_calloc(1, sizeof(*pvt->hfp)))) {
-@@ -4610,6 +6828,8 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
+@@ -4610,6 +6896,8 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
  	return pvt;
  
  e_free_sched:
@@ -3093,7 +3150,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	ast_sched_context_destroy(pvt->sched);
  e_free_dsp:
  	ast_dsp_free(pvt->dsp);
-@@ -4618,6 +6838,7 @@ e_free_bt_in_smoother:
+@@ -4618,6 +6906,7 @@ e_free_bt_in_smoother:
  e_free_bt_out_smoother:
  	ast_smoother_free(pvt->bt_out_smoother);
  e_free_pvt:
@@ -3101,7 +3158,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	ast_free(pvt);
  e_return:
  	return NULL;
-@@ -4643,6 +6864,26 @@ static int mbl_load_config(void)
+@@ -4643,6 +6932,26 @@ static int mbl_load_config(void)
  			if (!sscanf(v->value, "%d", &discovery_interval)) {
  				ast_log(LOG_NOTICE, "error parsing 'interval' in general section, using default value\n");
  			}
@@ -3128,7 +3185,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  		}
  	}
  
-@@ -4722,6 +6963,16 @@ static int unload_module(void)
+@@ -4722,6 +7031,16 @@ static int unload_module(void)
  		pthread_kill(discovery_thread, SIGURG);
  		pthread_join(discovery_thread, NULL);
  	}
@@ -3145,7 +3202,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  	/* stop the sco listener threads */
  	AST_RWLIST_WRLOCK(&adapters);
-@@ -4747,6 +6998,9 @@ static int unload_module(void)
+@@ -4747,6 +7066,9 @@ static int unload_module(void)
  		if (pvt->hfp) {
  			ast_free(pvt->hfp);
  		}
@@ -3155,7 +3212,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  
  		ast_smoother_free(pvt->bt_out_smoother);
  		ast_smoother_free(pvt->bt_in_smoother);
-@@ -4784,7 +7038,12 @@ static int load_module(void)
+@@ -4784,7 +7106,12 @@ static int load_module(void)
  		return AST_MODULE_LOAD_DECLINE;
  	}
  
@@ -3169,7 +3226,7 @@ diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
  	/* Check if we have Bluetooth, no point loading otherwise... */
  	dev_id = hci_get_route(NULL);
  
-@@ -4807,6 +7066,18 @@ static int load_module(void)
+@@ -4807,6 +7134,18 @@ static int load_module(void)
  	}
  
  	sdp_session = sdp_register();
