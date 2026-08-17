@@ -85,6 +85,33 @@ control, or the reverse, gives you a device that answers but carries no audio.
 Reloading the module also needs the adapter's voice setting applied first
 (`hciconfig <dev> voice 0x0060`), otherwise `module load chan_mobile` fails.
 
+## Caller ID over the call-control socket
+
+The `lecall` packet is a fixed 128 bytes and carries the caller identity as an
+optional payload on a call-state message:
+
+    [0]      uri length   0..CM_LE_CALL_URI_MAX  (32)
+    [1..n]   uri
+    [1+n]    name length  0..CM_LE_CALL_NAME_MAX (44)
+    [2+n..]  name
+
+`CM_LE_CALL_VERSION` is 2 and the check is strict — a packet with any other
+version is rejected with `-EPROTO` rather than parsed leniently, so both ends of
+the socket must be replaced together.  There is no negotiation and none is
+wanted: the two processes ship as a pair.
+
+The parser refuses a URI containing anything outside `0-9 + * # -`, and a name
+containing any non-printable byte.  A caller ID reaches a SIP header, so the
+peer is not trusted to have filtered it.
+
+Both lengths may be zero.  Our own deployment sends the number and leaves the
+name empty, because the softphone syncs the same address book and resolves the
+name from the number itself; the field is kept so that a deployment which does
+want it needs no protocol change.  When the number is withheld by the network or
+the originating server, the module renders `Anonymous`.
+
+The module logs whether a caller ID was present, never its value.
+
 ## Tests
 
 The media lifecycle tests need only liblc3 — no Asterisk tree, no Bluetooth

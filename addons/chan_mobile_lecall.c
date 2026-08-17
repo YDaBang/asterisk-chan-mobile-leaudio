@@ -106,6 +106,50 @@ int cm_le_call_valid_uri(const uint8_t *uri, size_t length)
 	return 1;
 }
 
+int cm_le_call_parse_identity(const uint8_t *payload, size_t length,
+	struct cm_le_call_identity *identity)
+{
+	size_t uri_length;
+	size_t name_offset;
+	size_t name_length;
+
+	if (!identity)
+		return -EINVAL;
+	memset(identity, 0, sizeof(*identity));
+	if (length == 0)
+		return 0;
+	if (!payload || length > CM_LE_CALL_PAYLOAD_SIZE)
+		return -EINVAL;
+	uri_length = payload[0];
+	if (uri_length > CM_LE_CALL_URI_MAX || 1 + uri_length >= length)
+		return -EPROTO;
+	name_offset = 1 + uri_length;
+	name_length = payload[name_offset];
+	if (name_length > CM_LE_CALL_NAME_MAX ||
+		name_offset + 1 + name_length != length)
+		return -EPROTO;
+	memcpy(identity->uri, payload + 1, uri_length);
+	identity->uri[uri_length] = '\0';
+	memcpy(identity->name, payload + name_offset + 1, name_length);
+	identity->name[name_length] = '\0';
+	/* A caller ID reaches a SIP header, so refuse anything that is not
+	 * printable rather than trusting the peer to have filtered it. */
+	for (uri_length = 0; identity->uri[uri_length] != '\0'; ++uri_length) {
+		unsigned char c = (unsigned char) identity->uri[uri_length];
+
+		if ((c < '0' || c > '9') && c != '+' && c != '*' && c != '#' &&
+			c != '-')
+			return -EPROTO;
+	}
+	for (name_length = 0; identity->name[name_length] != '\0'; ++name_length) {
+		unsigned char c = (unsigned char) identity->name[name_length];
+
+		if (c < 0x20 || c == 0x7f)
+			return -EPROTO;
+	}
+	return 0;
+}
+
 static int valid_message(const struct cm_le_call_message *message)
 {
 	if (!message || message->type < CM_LE_CALL_STATE ||
@@ -118,18 +162,26 @@ static int valid_message(const struct cm_le_call_message *message)
 		return 0;
 
 	switch (message->type) {
-	case CM_LE_CALL_STATE:
-		if (!(message->flags & CM_LE_CALL_FLAG_SNAPSHOT) ||
-			message->payload_length != 0)
+	case CM_LE_CALL_STATE: {
+		struct cm_le_call_identity identity;
+
+		if (!(message->flags & CM_LE_CALL_FLAG_SNAPSHOT))
 			return 0;
 		if (message->code == CM_LE_CALL_NO_STATE)
 			return message->index == 0 && message->token == 0 &&
-				message->value == 0;
-		return message->index != 0 && message->token != 0 &&
-			message->code <= CM_LE_CALL_STATE_LOCALLY_REMOTELY_HELD &&
+				message->value == 0 &&
+				message->payload_length == 0;
+		if (message->index == 0 || message->token == 0 ||
+			message->code > CM_LE_CALL_STATE_LOCALLY_REMOTELY_HELD ||
 			(message->value & ~(CM_LE_CALL_FLAG_OUTGOING |
 			 CM_LE_CALL_FLAG_WITHHELD_SERVER |
-			 CM_LE_CALL_FLAG_WITHHELD_NETWORK)) == 0;
+			 CM_LE_CALL_FLAG_WITHHELD_NETWORK)) != 0)
+			return 0;
+		/* A state message may carry a caller identity; a malformed one is
+		 * rejected here rather than reaching the channel layer. */
+		return cm_le_call_parse_identity(message->payload,
+			message->payload_length, &identity) == 0;
+	}
 	case CM_LE_CALL_COMMAND:
 		if (message->flags != 0 || message->code > CM_LE_CALL_JOIN)
 			return 0;

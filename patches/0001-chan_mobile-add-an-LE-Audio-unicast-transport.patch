@@ -4,6 +4,20 @@ Diff against Asterisk 22.9.0.  Apply from the top of an Asterisk tree
 with "patch -p1", then copy this repository addons/*.[ch] files into
 the tree addons/ directory.
 
+diff --git a/addons/Makefile b/addons/Makefile
+--- a/addons/Makefile
++++ b/addons/Makefile
+@@ -58,6 +58,9 @@ endif
+ include $(ASTTOPDIR)/Makefile.moddir_rules
+ 
+ chan_mobile.o: _ASTCFLAGS+=$(AST_NO_FORMAT_TRUNCATION)
++SBC_LIB?=-lsbc
++chan_mobile.so: LIBS+=$(SBC_LIB) $(LC3_LIB)
++$(call MOD_ADD_C,chan_mobile,chan_mobile_msbc.c chan_mobile_leaudio.c chan_mobile_lecall.c)
+ chan_ooh323.so: _ASTCFLAGS+=$(H323CFLAGS)
+ $(call MOD_ADD_C,chan_ooh323,$(H323SOURCE))
+ 
+diff --git a/addons/chan_mobile.c b/addons/chan_mobile.c
 --- a/addons/chan_mobile.c
 +++ b/addons/chan_mobile.c
 @@ -42,6 +42,8 @@
@@ -127,7 +141,7 @@ the tree addons/ directory.
  static int unloading_flag = 0;
  static inline int check_unloading(void);
  static inline void set_unloading(void);
-@@ -108,6 +196,11 @@
+@@ -108,6 +196,11 @@ struct adapter_pvt {
  	int *sco_id;					/*!< the io context id of the sco listener socket */
  	int sco_socket;					/*!< sco listener socket */
  	pthread_t sco_listener_thread;			/*!< sco listener thread */
@@ -139,7 +153,7 @@ the tree addons/ directory.
  	AST_LIST_ENTRY(adapter_pvt) entry;
  };
  
-@@ -131,10 +224,49 @@
+@@ -131,10 +224,51 @@ struct mbl_pvt {
  	int rfcomm_port;				/* rfcomm port number */
  	int rfcomm_socket;				/* rfcomm socket descriptor */
  	char rfcomm_buf[256];
@@ -167,12 +181,14 @@ the tree addons/ directory.
 +	uint8_t lecall_build_index;
 +	uint8_t lecall_build_state;
 +	uint8_t lecall_build_flags;
++	struct cm_le_call_identity lecall_build_identity;
 +	uint8_t lecall_pending_opcode;
 +	unsigned int lecall_ready:1;
 +	unsigned int lecall_build_has_call:1;
 +	unsigned int lecall_build_ambiguous:1;
 +	unsigned int lecall_local_answer_requested:1;
 +	unsigned int lecall_phone_answered:1;	/*!< answered on the handset, not here */
++	struct cm_le_call_identity lecall_identity;	/*!< GTBS caller, empty when unknown */
 +	unsigned int lecall_remote_ended:1;
 +	unsigned int leaudio_stats_reported:1;
 +	unsigned int leaudio_session_valid:1;
@@ -190,7 +206,7 @@ the tree addons/ directory.
  	pthread_t monitor_thread;			/* monitor thread handle */
  	int timeout;					/*!< used to set the timeout for rfcomm data (may be used in the future) */
  	unsigned int no_callsetup:1;
-@@ -159,6 +291,7 @@
+@@ -159,6 +293,7 @@ struct mbl_pvt {
  	unsigned int needring:1;	/*!< we need to send a RING */
  	unsigned int answered:1;	/*!< we sent/received an answer */
  	unsigned int connected:1;	/*!< do we have an rfcomm connection to a device */
@@ -198,7 +214,7 @@ the tree addons/ directory.
  
  	AST_LIST_ENTRY(mbl_pvt) entry;
  };
-@@ -215,7 +348,8 @@
+@@ -215,7 +350,8 @@ static char *mblsendsms_desc =
  "  Message - text of the message\n";
  
  static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinfo *cidinfo,
@@ -208,7 +224,7 @@ the tree addons/ directory.
  static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *cap,
  		const struct ast_assigned_ids *assignedids, const struct ast_channel *requestor, const char *data, int *cause);
  static int mbl_call(struct ast_channel *ast, const char *dest, int timeout);
-@@ -233,6 +367,18 @@
+@@ -233,6 +369,18 @@ static int mbl_queue_control(struct mbl_pvt *pvt, enum ast_control_frame_type co
  static int mbl_queue_hangup(struct mbl_pvt *pvt);
  static int mbl_ast_hangup(struct mbl_pvt *pvt);
  static int mbl_has_service(struct mbl_pvt *pvt);
@@ -227,7 +243,7 @@ the tree addons/ directory.
  
  static int rfcomm_connect(bdaddr_t src, bdaddr_t dst, int remote_channel);
  static int rfcomm_write(int rsock, char *buf);
-@@ -244,6 +390,8 @@
+@@ -244,6 +392,8 @@ static int sco_connect(bdaddr_t src, bdaddr_t dst);
  static int sco_write(int s, char *buf, int len);
  static int sco_accept(int *id, int fd, short events, void *data);
  static int sco_bind(struct adapter_pvt *adapter);
@@ -236,7 +252,7 @@ the tree addons/ directory.
  
  static void *do_sco_listen(void *data);
  static int sdp_search(char *addr, int profile);
-@@ -261,6 +409,8 @@
+@@ -261,6 +411,8 @@ static int headset_send_ring(const void *data);
  #define HFP_HF_VOLUME	(1 << 4)
  #define HFP_HF_STATUS	(1 << 5)
  #define HFP_HF_CONTROL	(1 << 6)
@@ -245,7 +261,7 @@ the tree addons/ directory.
  
  #define HFP_AG_CW	(1 << 0)
  #define HFP_AG_ECNR	(1 << 1)
-@@ -271,6 +421,8 @@
+@@ -271,6 +423,8 @@ static int headset_send_ring(const void *data);
  #define HFP_AG_STATUS	(1 << 6)
  #define HFP_AG_CONTROL	(1 << 7)
  #define HFP_AG_ERRORS	(1 << 8)
@@ -254,7 +270,7 @@ the tree addons/ directory.
  
  #define HFP_CIND_UNKNOWN	-1
  #define HFP_CIND_NONE		0
-@@ -307,6 +459,8 @@
+@@ -307,6 +461,8 @@ struct hfp_hf {
  	int volume:1;	/*!< remote volume control */
  	int status:1;	/*!< enhanced call status */
  	int control:1;	/*!< enhanced call control*/
@@ -263,7 +279,7 @@ the tree addons/ directory.
  };
  
  /*!
-@@ -322,6 +476,8 @@
+@@ -322,6 +478,8 @@ struct hfp_ag {
  	int status:1;	/*!< enhanced call status */
  	int control:1;	/*!< enhanced call control*/
  	int errors:1;	/*!< extended error result codes*/
@@ -272,7 +288,7 @@ the tree addons/ directory.
  };
  
  /*!
-@@ -366,6 +522,8 @@
+@@ -366,6 +524,8 @@ static struct hfp_hf hfp_our_brsf = {
  	.volume = 0,
  	.status = 0,
  	.control = 0,
@@ -281,7 +297,7 @@ the tree addons/ directory.
  };
  
  
-@@ -375,6 +533,7 @@
+@@ -375,6 +535,7 @@ static int parse_next_token(char string[], const int start, const char delim);
  static int hfp_parse_cmti(struct hfp_pvt *hfp, char *buf);
  static int hfp_parse_cmgr(struct hfp_pvt *hfp, char *buf, char **from_number, char **text);
  static int hfp_parse_brsf(struct hfp_pvt *hfp, const char *buf);
@@ -289,7 +305,7 @@ the tree addons/ directory.
  static int hfp_parse_cind(struct hfp_pvt *hfp, char *buf);
  static int hfp_parse_cind_test(struct hfp_pvt *hfp, char *buf);
  static char *hfp_parse_cusd(struct hfp_pvt *hfp, char *buf);
-@@ -383,6 +542,8 @@
+@@ -383,6 +544,8 @@ static int hfp_brsf2int(struct hfp_hf *hf);
  static struct hfp_ag *hfp_int2brsf(int brsf, struct hfp_ag *ag);
  
  static int hfp_send_brsf(struct hfp_pvt *hfp, struct hfp_hf *brsf);
@@ -298,7 +314,7 @@ the tree addons/ directory.
  static int hfp_send_cind(struct hfp_pvt *hfp);
  static int hfp_send_cind_test(struct hfp_pvt *hfp);
  static int hfp_send_cmer(struct hfp_pvt *hfp, int status);
-@@ -426,6 +587,7 @@
+@@ -426,6 +589,7 @@ typedef enum {
  	AT_ERROR,
  	AT_RING,
  	AT_BRSF,
@@ -306,7 +322,7 @@ the tree addons/ directory.
  	AT_CIND,
  	AT_CIEV,
  	AT_CLIP,
-@@ -445,6 +607,7 @@
+@@ -445,6 +609,7 @@ typedef enum {
  	AT_CMGF,
  	AT_CNMI,
  	AT_CMER,
@@ -314,7 +330,7 @@ the tree addons/ directory.
  	AT_CIND_TEST,
  	AT_CUSD,
  	AT_BUSY,
-@@ -517,16 +680,29 @@
+@@ -517,16 +682,29 @@ static char *handle_cli_mobile_show_devices(struct ast_cli_entry *e, int cmd, st
  	ast_cli(a->fd, FORMAT1, "ID", "Address", "Group", "Adapter", "Connected", "State", "SMS");
  	AST_RWLIST_RDLOCK(&devices);
  	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
@@ -347,7 +363,7 @@ the tree addons/ directory.
  				(pvt->has_sms) ? "Yes" : "No"
  		       );
  		ast_mutex_unlock(&pvt->lock);
-@@ -746,7 +922,7 @@
+@@ -746,7 +924,7 @@ static int mbl_status_exec(struct ast_channel *ast, const char *data)
  
  	if (pvt) {
  		ast_mutex_lock(&pvt->lock);
@@ -356,7 +372,7 @@ the tree addons/ directory.
  			stat = 2;
  		if (pvt->owner)
  			stat = 3;
-@@ -844,12 +1020,468 @@
+@@ -844,12 +1022,468 @@ e_return:
  
  */
  
@@ -826,7 +842,7 @@ the tree addons/ directory.
  	pvt->alignment_count = 0;
  	pvt->alignment_detection_triggered = 0;
  	if (pvt->adapter->alignment_detection)
-@@ -857,8 +1489,65 @@
+@@ -857,8 +1491,65 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
  	else
  		pvt->do_alignment_detection = 0;
  
@@ -894,7 +910,7 @@ the tree addons/ directory.
  	ast_dsp_digitreset(pvt->dsp);
  
  	chn = ast_channel_alloc(1, state,
-@@ -870,12 +1559,18 @@
+@@ -870,12 +1561,18 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
  		goto e_return;
  	}
  
@@ -918,7 +934,7 @@ the tree addons/ directory.
  	ast_channel_tech_pvt_set(chn, pvt);
  
  	if (state == AST_STATE_RING)
-@@ -883,8 +1578,23 @@
+@@ -883,8 +1580,23 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
  
  	ast_channel_language_set(chn, "en");
  	pvt->owner = chn;
@@ -943,7 +959,7 @@ the tree addons/ directory.
  		ast_channel_set_fd(chn, 0, pvt->sco_socket);
  	}
  	ast_channel_unlock(chn);
-@@ -892,6 +1602,10 @@
+@@ -892,6 +1604,10 @@ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinf
  	return chn;
  
  e_return:
@@ -954,7 +970,7 @@ the tree addons/ directory.
  	return NULL;
  }
  
-@@ -911,7 +1625,10 @@
+@@ -911,7 +1627,10 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
  		return NULL;
  	}
  
@@ -966,7 +982,7 @@ the tree addons/ directory.
  		struct ast_str *codec_buf = ast_str_alloca(AST_FORMAT_CAP_NAMES_LEN);
  		ast_log(LOG_WARNING, "Asked to get a channel of unsupported format '%s'\n", ast_format_cap_get_names(cap, &codec_buf));
  		*cause = AST_CAUSE_FACILITY_NOT_IMPLEMENTED;
-@@ -931,8 +1648,12 @@
+@@ -931,8 +1650,12 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
  	/* Find requested device and make sure it's connected. */
  	AST_RWLIST_RDLOCK(&devices);
  	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
@@ -981,7 +997,7 @@ the tree addons/ directory.
  				continue;
  			}
  
-@@ -942,7 +1663,9 @@
+@@ -942,7 +1665,9 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
  		}
  	}
  	AST_RWLIST_UNLOCK(&devices);
@@ -992,7 +1008,7 @@ the tree addons/ directory.
  		ast_log(LOG_WARNING, "Request to call on device %s which is not connected / already in use.\n", dest_dev);
  		*cause = AST_CAUSE_REQUESTED_CHAN_UNAVAIL;
  		return NULL;
-@@ -955,7 +1678,24 @@
+@@ -955,7 +1680,24 @@ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *
  	}
  
  	ast_mutex_lock(&pvt->lock);
@@ -1018,7 +1034,7 @@ the tree addons/ directory.
  	ast_mutex_unlock(&pvt->lock);
  	if (!chn) {
  		ast_log(LOG_WARNING, "Unable to allocate channel structure.\n");
-@@ -995,14 +1735,41 @@
+@@ -995,14 +1737,41 @@ static int mbl_call(struct ast_channel *ast, const char *dest, int timeout)
  
  	ast_mutex_lock(&pvt->lock);
  	if (pvt->type == MBL_TYPE_PHONE) {
@@ -1067,7 +1083,7 @@ the tree addons/ directory.
  	} else {
  		if (hsp_send_ring(pvt->rfcomm_socket)) {
  			ast_log(LOG_ERROR, "[%s] error ringing device\n", pvt->id);
-@@ -1039,18 +1806,57 @@
+@@ -1039,18 +1808,57 @@ static int mbl_hangup(struct ast_channel *ast)
  	ast_debug(1, "[%s] hanging up device\n", pvt->id);
  
  	ast_mutex_lock(&pvt->lock);
@@ -1128,7 +1144,7 @@ the tree addons/ directory.
  	pvt->needring = 0;
  	pvt->owner = NULL;
  	ast_channel_tech_pvt_set(ast, NULL);
-@@ -1075,9 +1881,24 @@
+@@ -1075,9 +1883,24 @@ static int mbl_answer(struct ast_channel *ast)
  
  	ast_mutex_lock(&pvt->lock);
  	if (pvt->incoming) {
@@ -1156,7 +1172,7 @@ the tree addons/ directory.
  	}
  	ast_mutex_unlock(&pvt->lock);
  
-@@ -1093,6 +1914,13 @@
+@@ -1093,6 +1916,13 @@ static int mbl_digit_end(struct ast_channel *ast, char digit, unsigned int durat
  		return 0;
  
  	ast_mutex_lock(&pvt->lock);
@@ -1170,7 +1186,7 @@ the tree addons/ directory.
  	if (hfp_send_dtmf(pvt->hfp, digit)) {
  		ast_mutex_unlock(&pvt->lock);
  		ast_debug(1, "[%s] error sending digit %c\n", pvt->id, digit);
-@@ -1106,26 +1934,171 @@
+@@ -1106,26 +1936,171 @@ static int mbl_digit_end(struct ast_channel *ast, char digit, unsigned int durat
  	return 0;
  }
  
@@ -1345,7 +1361,7 @@ the tree addons/ directory.
  	pvt->fr.src = "Mobile";
  	pvt->fr.offset = AST_FRIENDLY_OFFSET;
  	pvt->fr.mallocd = 0;
-@@ -1134,25 +2107,81 @@
+@@ -1134,25 +2109,81 @@ static struct ast_frame *mbl_read(struct ast_channel *ast)
  	pvt->fr.data.ptr = pvt->io_buf + AST_FRIENDLY_OFFSET;
  
  	do {
@@ -1382,6 +1398,9 @@ the tree addons/ directory.
  
 -		pvt->fr.datalen = r;
 -		pvt->fr.samples = r / 2;
+-
+-		if (pvt->do_alignment_detection)
+-			do_alignment_detection(pvt, pvt->fr.data.ptr, r);
 +		if (pvt->audio_codec == MBL_AUDIO_MSBC) {
 +			if (pvt->msbc_stats.active)
 +				mbl_stats_add(&pvt->msbc_stats.sco_rx_bytes,
@@ -1408,13 +1427,11 @@ the tree addons/ directory.
 +		if (samples == 0)
 +			goto e_return;
  
--		if (pvt->do_alignment_detection)
--			do_alignment_detection(pvt, pvt->fr.data.ptr, r);
-+		pvt->fr.samples = samples;
-+		pvt->fr.datalen = samples * sizeof(int16_t);
- 
 -		ast_smoother_feed(pvt->bt_in_smoother, &pvt->fr);
 -		fr = ast_smoother_read(pvt->bt_in_smoother);
++		pvt->fr.samples = samples;
++		pvt->fr.datalen = samples * sizeof(int16_t);
++
 +		if (pvt->audio_codec == MBL_AUDIO_MSBC) {
 +			/* A single SCO read can decode more than one 120-sample mSBC
 +			 * frame, including frames reconstructed by packet-loss
@@ -1435,7 +1452,7 @@ the tree addons/ directory.
  	fr = ast_dsp_process(ast, pvt->dsp, fr);
  
  	ast_mutex_unlock(&pvt->lock);
-@@ -1169,8 +2198,11 @@
+@@ -1169,8 +2200,11 @@ static int mbl_write(struct ast_channel *ast, struct ast_frame *frame)
  
  	struct mbl_pvt *pvt = ast_channel_tech_pvt(ast);
  	struct ast_frame *f;
@@ -1447,7 +1464,7 @@ the tree addons/ directory.
  
  	if (frame->frametype != AST_FRAME_VOICE) {
  		return 0;
-@@ -1179,11 +2211,112 @@
+@@ -1179,11 +2213,112 @@ static int mbl_write(struct ast_channel *ast, struct ast_frame *frame)
  	while (ast_mutex_trylock(&pvt->lock)) {
  		CHANNEL_DEADLOCK_AVOIDANCE(ast);
  	}
@@ -1461,8 +1478,7 @@ the tree addons/ directory.
 +	}
 +	if (pvt->call_audio_transport == MBL_CALL_AUDIO_LE) {
 +		const struct cm_leaudio_io_stats *stats;
- 
--	ast_smoother_feed(pvt->bt_out_smoother, frame);
++
 +		if (!pvt->leaudio_session_valid ||
 +			pvt->leaudio_session_owner != ast ||
 +			!cm_leaudio_tx_active(&pvt->leaudio)) {
@@ -1503,7 +1519,8 @@ the tree addons/ directory.
 +		ast_mutex_unlock(&pvt->lock);
 +		return 0;
 +	}
-+
+ 
+-	ast_smoother_feed(pvt->bt_out_smoother, frame);
 +	if (ast_smoother_feed(pvt->bt_out_smoother, frame) < 0) {
 +		if (pvt->msbc_stats.active)
 +			mbl_stats_inc(&pvt->msbc_stats.tx_smoother_failures);
@@ -1562,7 +1579,7 @@ the tree addons/ directory.
  	}
  
  	ast_mutex_unlock(&pvt->lock);
-@@ -1203,8 +2336,11 @@
+@@ -1203,8 +2338,11 @@ static int mbl_fixup(struct ast_channel *oldchan, struct ast_channel *newchan)
  	}
  
  	ast_mutex_lock(&pvt->lock);
@@ -1575,7 +1592,7 @@ the tree addons/ directory.
  	ast_mutex_unlock(&pvt->lock);
  
  	return 0;
-@@ -1233,13 +2369,14 @@
+@@ -1233,13 +2371,14 @@ static int mbl_devicestate(const char *data)
  		return res;
  
  	ast_mutex_lock(&pvt->lock);
@@ -1592,7 +1609,7 @@ the tree addons/ directory.
  			res = AST_DEVICE_UNAVAILABLE;
  	}
  	ast_mutex_unlock(&pvt->lock);
-@@ -1871,7 +3008,7 @@
+@@ -1871,7 +3010,7 @@ static int sco_connect(bdaddr_t src, bdaddr_t dst)
  static int sco_write(int s, char *buf, int len)
  {
  
@@ -1601,7 +1618,7 @@ the tree addons/ directory.
  
  	if (s == -1) {
  		ast_debug(3, "sco_write() not ready\n");
-@@ -1880,9 +3017,15 @@
+@@ -1880,9 +3019,15 @@ static int sco_write(int s, char *buf, int len)
  
  	ast_debug(3, "sco_write()\n");
  
@@ -1620,7 +1637,7 @@ the tree addons/ directory.
  		return 0;
  	}
  
-@@ -1901,9 +3044,7 @@
+@@ -1901,9 +3046,7 @@ static int sco_accept(int *id, int fd, short events, void *data)
  	struct sockaddr_sco addr;
  	socklen_t addrlen;
  	struct mbl_pvt *pvt;
@@ -1630,7 +1647,7 @@ the tree addons/ directory.
  	int sock;
  
  	addrlen = sizeof(struct sockaddr_sco);
-@@ -1912,11 +3053,8 @@
+@@ -1912,11 +3055,8 @@ static int sco_accept(int *id, int fd, short events, void *data)
  		return 0;
  	}
  
@@ -1643,7 +1660,7 @@ the tree addons/ directory.
  
  	/* figure out which device this sco connection belongs to */
  	pvt = NULL;
-@@ -1933,6 +3071,70 @@
+@@ -1933,6 +3073,70 @@ static int sco_accept(int *id, int fd, short events, void *data)
  	}
  
  	ast_mutex_lock(&pvt->lock);
@@ -1714,7 +1731,7 @@ the tree addons/ directory.
  	if (pvt->sco_socket != -1) {
  		close(pvt->sco_socket);
  		pvt->sco_socket = -1;
-@@ -1940,7 +3142,12 @@
+@@ -1940,7 +3144,12 @@ static int sco_accept(int *id, int fd, short events, void *data)
  
  	pvt->sco_socket = sock;
  	if (pvt->owner) {
@@ -1728,7 +1745,7 @@ the tree addons/ directory.
  	} else {
  		ast_debug(1, "incoming audio connection for pvt without owner\n");
  	}
-@@ -1964,7 +3171,6 @@
+@@ -1964,7 +3173,6 @@ static int sco_bind(struct adapter_pvt *adapter)
  		ast_log(LOG_ERROR, "Unable to create sco listener socket for adapter %s.\n", adapter->id);
  		goto e_return;
  	}
@@ -1736,7 +1753,7 @@ the tree addons/ directory.
  	memset(&addr, 0, sizeof(addr));
  	addr.sco_family = AF_BLUETOOTH;
  	bacpy(&addr.sco_bdaddr, &adapter->addr);
-@@ -1972,6 +3178,14 @@
+@@ -1972,6 +3180,14 @@ static int sco_bind(struct adapter_pvt *adapter)
  		ast_log(LOG_ERROR, "Unable to bind sco listener socket. (%d)\n", errno);
  		goto e_close_socket;
  	}
@@ -1751,7 +1768,7 @@ the tree addons/ directory.
  	if (setsockopt(adapter->sco_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
  		ast_log(LOG_ERROR, "Unable to setsockopt sco listener socket.\n");
  		goto e_close_socket;
-@@ -1990,6 +3204,80 @@
+@@ -1990,6 +3206,80 @@ e_return:
  	return -1;
  }
  
@@ -1832,7 +1849,7 @@ the tree addons/ directory.
  
  /*
   * Hayes AT command helpers.
-@@ -2037,6 +3325,8 @@
+@@ -2037,6 +3327,8 @@ static at_message_t at_read_full(int rsock, char *buf, size_t count)
  		return AT_CIEV;
  	} else if (at_match_prefix(buf, "+BRSF:")) {
  		return AT_BRSF;
@@ -1841,7 +1858,7 @@ the tree addons/ directory.
  	} else if (at_match_prefix(buf, "+CIND:")) {
  		return AT_CIND;
  	} else if (at_match_prefix(buf, "+CLIP:")) {
-@@ -2093,6 +3383,8 @@
+@@ -2093,6 +3385,8 @@ static inline const char *at_msg2str(at_message_t msg)
  		return "RING";
  	case AT_BRSF:
  		return "AT+BRSF";
@@ -1850,7 +1867,7 @@ the tree addons/ directory.
  	case AT_CIND:
  		return "AT+CIND";
  	case AT_CIEV:
-@@ -2136,6 +3428,8 @@
+@@ -2136,6 +3430,8 @@ static inline const char *at_msg2str(at_message_t msg)
  		return "AT+CNMI";
  	case AT_CMER:
  		return "AT+CMER";
@@ -1859,7 +1876,7 @@ the tree addons/ directory.
  	case AT_CIND_TEST:
  		return "AT+CIND=?";
  	case AT_CUSD:
-@@ -2478,6 +3772,8 @@
+@@ -2478,6 +3774,8 @@ static int hfp_brsf2int(struct hfp_hf *hf)
  	brsf |= hf->volume ? HFP_HF_VOLUME : 0;
  	brsf |= hf->status ? HFP_HF_STATUS : 0;
  	brsf |= hf->control ? HFP_HF_CONTROL : 0;
@@ -1868,7 +1885,7 @@ the tree addons/ directory.
  
  	return brsf;
  }
-@@ -2500,6 +3796,8 @@
+@@ -2500,6 +3798,8 @@ static struct hfp_ag *hfp_int2brsf(int brsf, struct hfp_ag *ag)
  	ag->status = brsf & HFP_AG_STATUS ? 1 : 0;
  	ag->control = brsf & HFP_AG_CONTROL ? 1 : 0;
  	ag->errors = brsf & HFP_AG_ERRORS ? 1 : 0;
@@ -1877,7 +1894,7 @@ the tree addons/ directory.
  
  	return ag;
  }
-@@ -2520,6 +3818,22 @@
+@@ -2520,6 +3820,22 @@ static int hfp_send_brsf(struct hfp_pvt *hfp, struct hfp_hf *brsf)
  	return rfcomm_write(hfp->rsock, cmd);
  }
  
@@ -1900,7 +1917,7 @@ the tree addons/ directory.
  /*!
   * \brief Send the CIND read command.
   * \param hfp an hfp_pvt struct
-@@ -2735,6 +4049,13 @@
+@@ -2735,6 +4051,13 @@ static int hfp_parse_brsf(struct hfp_pvt *hfp, const char *buf)
  	return 0;
  }
  
@@ -1914,7 +1931,7 @@ the tree addons/ directory.
  /*!
   * \brief Parse and store the given indicator.
   * \param hfp an hfp_pvt struct
-@@ -3120,30 +4441,58 @@
+@@ -3120,30 +4443,58 @@ static int sdp_search(char *addr, int profile)
  
  static sdp_session_t *sdp_register(void)
  {
@@ -1978,7 +1995,7 @@ the tree addons/ directory.
  	sdp_uuid16_create(&root_uuid, PUBLIC_BROWSE_GROUP);
  	root_list = sdp_list_append(0, &root_uuid);
  	sdp_set_browse_groups( record, root_list );
-@@ -3177,6 +4526,7 @@
+@@ -3177,6 +4528,7 @@ static sdp_session_t *sdp_register(void)
  	sdp_list_free(root_list, 0);
  	sdp_list_free(access_proto_list, 0);
  	sdp_list_free(svc_uuid_list, 0);
@@ -1986,7 +2003,7 @@ the tree addons/ directory.
  
  	return session;
  
-@@ -3203,6 +4553,9 @@
+@@ -3203,6 +4555,9 @@ static int handle_response_brsf(struct mbl_pvt *pvt, char *buf)
  			ast_debug(1, "[%s] error parsing BRSF\n", pvt->id);
  			goto e_return;
  		}
@@ -1996,10 +2013,21 @@ the tree addons/ directory.
  
  		if (msg_queue_push(pvt, AT_OK, AT_BRSF)) {
  			ast_debug(1, "[%s] error handling BRSF\n", pvt->id);
-@@ -3223,6 +4576,85 @@
- 	return -1;
- }
- 
+@@ -3213,14 +4568,93 @@ static int handle_response_brsf(struct mbl_pvt *pvt, char *buf)
+ 	} else if (entry) {
+ 		ast_debug(1, "[%s] received unexpected AT message 'BRSF' when expecting %s, ignoring\n", pvt->id, at_msg2str(entry->expected));
+ 	} else {
+-		ast_debug(1, "[%s] received unexpected AT message 'BRSF'\n", pvt->id);
++		ast_debug(1, "[%s] received unexpected AT message 'BRSF'\n", pvt->id);
++	}
++
++	return 0;
++
++e_return:
++	msg_queue_free_and_pop(pvt);
++	return -1;
++}
++
 +static int hfp_continue_slc_after_codec_setup(struct mbl_pvt *pvt)
 +{
 +	/* If this is a blackberry do CMER now, otherwise continue with CIND. */
@@ -2071,18 +2099,20 @@ the tree addons/ directory.
 +			msg_queue_push(pvt, AT_OK, AT_BAC))
 +			return -1;
 +		return 0;
-+	}
-+
+ 	}
+ 
 +	if (hfp_send_bcs(pvt->hfp, codec) ||
 +		msg_queue_push(pvt, AT_OK, AT_BCS))
 +		return -1;
-+	return 0;
-+}
-+
+ 	return 0;
+-
+-e_return:
+-	msg_queue_free_and_pop(pvt);
+-	return -1;
+ }
+ 
  /*!
-  * \brief Handle the CIND response.
-  * \param pvt a mbl_pvt structure
-@@ -3281,21 +4713,34 @@
+@@ -3281,21 +4715,34 @@ static int handle_response_ok(struct mbl_pvt *pvt, char *buf)
  		/* initialization stuff */
  		case AT_BRSF:
  			ast_debug(1, "[%s] BSRF sent successfully\n", pvt->id);
@@ -2104,10 +2134,9 @@ the tree addons/ directory.
 -					ast_debug(1, "[%s] error sending CIND test\n", pvt->id);
 +				pvt->wideband_capable = 0;
 +				if (hfp_continue_slc_after_codec_setup(pvt))
- 					goto e_return;
--				}
- 			}
- 			break;
++					goto e_return;
++			}
++			break;
 +		case AT_BAC:
 +			if (!pvt->hfp->initialized) {
 +				pvt->wideband_capable = pvt->wideband_requested &&
@@ -2117,16 +2146,17 @@ the tree addons/ directory.
 +					pvt->wideband_capable ? "enabled" : "disabled",
 +					pvt->wideband_capable ? ", mSBC" : "");
 +				if (hfp_continue_slc_after_codec_setup(pvt))
-+					goto e_return;
-+			}
-+			break;
+ 					goto e_return;
+-				}
+ 			}
+ 			break;
 +		case AT_BCS:
 +			ast_debug(1, "[%s] codec selection acknowledged\n", pvt->id);
 +			break;
  		case AT_CIND_TEST:
  			ast_debug(1, "[%s] CIND test sent successfully\n", pvt->id);
  
-@@ -3456,6 +4901,28 @@
+@@ -3456,6 +4903,28 @@ static int handle_response_error(struct mbl_pvt *pvt, char *buf)
  		case AT_BRSF:
  			ast_debug(1, "[%s] error reading BSRF\n", pvt->id);
  			goto e_return;
@@ -2155,7 +2185,7 @@ the tree addons/ directory.
  		case AT_CIND_TEST:
  			ast_debug(1, "[%s] error during CIND test\n", pvt->id);
  			goto e_return;
-@@ -3581,6 +5048,7 @@
+@@ -3581,6 +5050,7 @@ static int handle_response_ciev(struct mbl_pvt *pvt, char *buf)
  		case HFP_CIND_CALL_ACTIVE:
  			if (pvt->outgoing) {
  				ast_debug(1, "[%s] remote end answered\n", pvt->id);
@@ -2163,7 +2193,7 @@ the tree addons/ directory.
  				mbl_queue_control(pvt, AST_CONTROL_ANSWER);
  			} else if (pvt->incoming && pvt->answered) {
  				ast_setstate(pvt->owner, AST_STATE_UP);
-@@ -3662,12 +5130,13 @@
+@@ -3662,12 +5132,13 @@ static int handle_response_clip(struct mbl_pvt *pvt, char *buf)
  		pvt->needcallerid = 0;
  		cidinfo = hfp_parse_clip(pvt->hfp, buf);
  
@@ -2178,7 +2208,7 @@ the tree addons/ directory.
  
  		/* from this point on, we need to send a chup in the event of a
  		 * hangup */
-@@ -3752,7 +5221,7 @@
+@@ -3752,7 +5223,7 @@ static int handle_response_cmgr(struct mbl_pvt *pvt, char *buf)
  		pvt->incoming_sms = 0;
  
  		/* XXX this channel probably does not need to be associated with this pvt */
@@ -2187,7 +2217,7 @@ the tree addons/ directory.
  			ast_debug(1, "[%s] error creating sms message channel, disconnecting\n", pvt->id);
  			return -1;
  		}
-@@ -3873,6 +5342,7 @@
+@@ -3873,6 +5344,7 @@ static void *do_monitor_phone(void *data)
  {
  	struct mbl_pvt *pvt = (struct mbl_pvt *)data;
  	struct hfp_pvt *hfp = pvt->hfp;
@@ -2195,7 +2225,7 @@ the tree addons/ directory.
  	char buf[350];
  	int t;
  	at_message_t at_msg;
-@@ -3886,8 +5356,15 @@
+@@ -3886,8 +5358,15 @@ static void *do_monitor_phone(void *data)
  
  	/* start initialization with the BRSF request */
  	ast_mutex_lock(&pvt->lock);
@@ -2212,7 +2242,7 @@ the tree addons/ directory.
  		ast_debug(1, "[%s] error sending BRSF\n", hfp->owner->id);
  		goto e_cleanup;
  	}
-@@ -3942,6 +5419,14 @@
+@@ -3942,6 +5421,14 @@ static void *do_monitor_phone(void *data)
  			}
  			ast_mutex_unlock(&pvt->lock);
  			break;
@@ -2227,7 +2257,7 @@ the tree addons/ directory.
  		case AT_CIND:
  			ast_mutex_lock(&pvt->lock);
  			if (handle_response_cind(pvt, buf)) {
-@@ -4077,6 +5562,7 @@
+@@ -4077,6 +5564,7 @@ e_cleanup:
  		ast_verb(3, "Error initializing Bluetooth device %s.\n", pvt->id);
  
  	ast_mutex_lock(&pvt->lock);
@@ -2235,7 +2265,7 @@ the tree addons/ directory.
  	if (pvt->owner) {
  		ast_debug(1, "[%s] device disconnected, hanging up owner\n", pvt->id);
  		pvt->needchup = 0;
-@@ -4204,7 +5690,7 @@
+@@ -4204,7 +5692,7 @@ static void *do_monitor_headset(void *data)
  
  				pvt->incoming = 1;
  
@@ -2244,7 +2274,7 @@ the tree addons/ directory.
  					ast_log(LOG_ERROR, "[%s] unable to allocate channel for incoming call\n", pvt->id);
  					ast_mutex_unlock(&pvt->lock);
  					goto e_cleanup;
-@@ -4294,7 +5780,9 @@
+@@ -4294,7 +5782,9 @@ static void *do_discovery(void *data)
  				AST_RWLIST_RDLOCK(&devices);
  				AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
  					ast_mutex_lock(&pvt->lock);
@@ -2255,7 +2285,7 @@ the tree addons/ directory.
  						if ((pvt->rfcomm_socket = rfcomm_connect(adapter->addr, pvt->addr, pvt->rfcomm_port)) > -1) {
  							if (start_monitor(pvt)) {
  								pvt->connected = 1;
-@@ -4347,6 +5835,572 @@
+@@ -4347,6 +5837,602 @@ static void *do_sco_listen(void *data)
  	return NULL;
  }
  
@@ -2419,6 +2449,7 @@ the tree addons/ directory.
 +	pvt->lecall_build_index = 0;
 +	pvt->lecall_build_state = 0;
 +	pvt->lecall_build_flags = 0;
++	memset(&pvt->lecall_build_identity, 0, sizeof(pvt->lecall_build_identity));
 +	pvt->lecall_build_has_call = 0;
 +	pvt->lecall_build_ambiguous = 0;
 +}
@@ -2469,10 +2500,27 @@ the tree addons/ directory.
 +	if (pvt->owner || pvt->lecall_token == 0 ||
 +		pvt->lecall_token == pvt->lecall_suppressed_token)
 +		return;
++	struct cidinfo cidinfo = { .cnum = NULL, .cnam = NULL };
++	char withheld[] = "Anonymous";
++
 +	pvt->incoming = 1;
 +	pvt->outgoing = 0;
 +	pvt->needchup = 0;
-+	channel = mbl_new(AST_STATE_RING, pvt, NULL, NULL, NULL, NULL);
++	/* Caller ID, in the three shapes the phone actually produces.  A withheld
++	 * number has nothing to show, so say so rather than leaving an empty field
++	 * that renders as a blank caller.  A caller who is not in the phone's
++	 * contacts has a number and no name, and the softphone then shows the
++	 * number where the name would be -- which is what the handset does too. */
++	if ((pvt->lecall_flags & (CM_LE_CALL_FLAG_WITHHELD_SERVER |
++		CM_LE_CALL_FLAG_WITHHELD_NETWORK)) != 0) {
++		cidinfo.cnam = withheld;
++	} else {
++		if (pvt->lecall_identity.uri[0] != '\0')
++			cidinfo.cnum = pvt->lecall_identity.uri;
++		if (pvt->lecall_identity.name[0] != '\0')
++			cidinfo.cnam = pvt->lecall_identity.name;
++	}
++	channel = mbl_new(AST_STATE_RING, pvt, &cidinfo, NULL, NULL, NULL);
 +	if (!channel) {
 +		ast_log(LOG_ERROR,
 +			"[%s] unable to allocate channel for GTBS incoming call\n",
@@ -2489,9 +2537,12 @@ the tree addons/ directory.
 +		mbl_queue_hangup(pvt);
 +		return;
 +	}
++	/* Presence only.  The number and the name reach the channel, not the log. */
 +	ast_log(LOG_NOTICE,
-+		"[%s] routed one GTBS incoming call without caller URI exposure token=%" PRIu64 "\n",
-+		pvt->id, pvt->lecall_token);
++		"[%s] routed one GTBS incoming call token=%" PRIu64 " caller_number=%s caller_name=%s\n",
++		pvt->id, pvt->lecall_token,
++		cidinfo.cnum ? "present" : "absent",
++		cidinfo.cnam ? "present" : "absent");
 +}
 +
 +/* The caller holds pvt->lock and has received one complete snapshot. */
@@ -2577,6 +2628,7 @@ the tree addons/ directory.
 +	pvt->lecall_index = pvt->lecall_build_index;
 +	pvt->lecall_state = pvt->lecall_build_state;
 +	pvt->lecall_flags = pvt->lecall_build_flags;
++	pvt->lecall_identity = pvt->lecall_build_identity;
 +	pvt->lecall_snapshot_sequence = sequence;
 +	pvt->lecall_remote_ended = 0;
 +
@@ -2688,6 +2740,14 @@ the tree addons/ directory.
 +			pvt->lecall_build_index = message->index;
 +			pvt->lecall_build_state = message->code;
 +			pvt->lecall_build_flags = message->value;
++			/* valid_message() already accepted this payload, so a failure
++			 * here is not expected; leave the identity empty rather than
++			 * discarding an otherwise good call. */
++			if (cm_le_call_parse_identity(message->payload,
++				message->payload_length,
++				&pvt->lecall_build_identity) != 0)
++				memset(&pvt->lecall_build_identity, 0,
++					sizeof(pvt->lecall_build_identity));
 +		}
 +		if (message->flags & CM_LE_CALL_FLAG_LAST)
 +			mbl_lecall_commit_locked(pvt);
@@ -2828,7 +2888,7 @@ the tree addons/ directory.
  /*
  
  	Module
-@@ -4366,9 +6420,14 @@
+@@ -4366,9 +6452,14 @@ static void *do_sco_listen(void *data)
  static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *cat)
  {
  	const char *id, *address;
@@ -2843,7 +2903,7 @@ the tree addons/ directory.
  	uint16_t vs;
  
  	id = ast_variable_retrieve(cfg, cat, "id");
-@@ -4389,6 +6448,28 @@
+@@ -4389,6 +6480,28 @@ static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *
  	ast_copy_string(adapter->id, id, sizeof(adapter->id));
  	str2ba(address, &adapter->addr);
  
@@ -2872,7 +2932,7 @@ the tree addons/ directory.
  	/* attempt to connect to the adapter */
  	adapter->dev_id = hci_devid(address);
  	adapter->hci_socket = hci_open_dev(adapter->dev_id);
-@@ -4397,8 +6478,39 @@
+@@ -4397,8 +6510,39 @@ static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *
  		goto e_free_adapter;
  	}
  
@@ -2913,7 +2973,7 @@ the tree addons/ directory.
  	vs = htobs(vs);
  	if (vs != 0x0060) {
  		ast_log(LOG_ERROR, "Skipping adapter %s. Voice setting must be 0x0060 - see 'man hciconfig' for details.\n", adapter->id);
-@@ -4524,6 +6636,12 @@
+@@ -4524,6 +6668,12 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
  	/* set some defaults */
  
  	pvt->type = MBL_TYPE_PHONE;
@@ -2926,7 +2986,7 @@ the tree addons/ directory.
  	ast_copy_string(pvt->context, "default", sizeof(pvt->context));
  
  	/* populate the pvt structure */
-@@ -4539,13 +6657,13 @@
+@@ -4539,13 +6689,13 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
  	pvt->has_sms = 1;
  
  	/* setup the bt_out_smoother */
@@ -2942,7 +3002,7 @@ the tree addons/ directory.
  		ast_log(LOG_ERROR, "Skipping device %s. Error setting up frame bt_in_smoother.\n", cat);
  		goto e_free_bt_out_smoother;
  	}
-@@ -4578,6 +6696,24 @@
+@@ -4578,6 +6728,24 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
  			pvt->group = atoi(v->value);
  		} else if (!strcasecmp(v->name, "sms")) {
  			pvt->has_sms = ast_true(v->value);
@@ -2967,7 +3027,7 @@ the tree addons/ directory.
  		} else if (!strcasecmp(v->name, "nocallsetup")) {
  			pvt->no_callsetup = ast_true(v->value);
  
-@@ -4588,6 +6724,56 @@
+@@ -4588,6 +6756,56 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
  			pvt->has_sms = 0;
  		}
  	}
@@ -3024,7 +3084,7 @@ the tree addons/ directory.
  
  	if (pvt->type == MBL_TYPE_PHONE) {
  		if (!(pvt->hfp = ast_calloc(1, sizeof(*pvt->hfp)))) {
-@@ -4610,6 +6796,8 @@
+@@ -4610,6 +6828,8 @@ static struct mbl_pvt *mbl_load_device(struct ast_config *cfg, const char *cat)
  	return pvt;
  
  e_free_sched:
@@ -3033,7 +3093,7 @@ the tree addons/ directory.
  	ast_sched_context_destroy(pvt->sched);
  e_free_dsp:
  	ast_dsp_free(pvt->dsp);
-@@ -4618,6 +6806,7 @@
+@@ -4618,6 +6838,7 @@ e_free_bt_in_smoother:
  e_free_bt_out_smoother:
  	ast_smoother_free(pvt->bt_out_smoother);
  e_free_pvt:
@@ -3041,7 +3101,7 @@ the tree addons/ directory.
  	ast_free(pvt);
  e_return:
  	return NULL;
-@@ -4643,6 +6832,26 @@
+@@ -4643,6 +6864,26 @@ static int mbl_load_config(void)
  			if (!sscanf(v->value, "%d", &discovery_interval)) {
  				ast_log(LOG_NOTICE, "error parsing 'interval' in general section, using default value\n");
  			}
@@ -3068,7 +3128,7 @@ the tree addons/ directory.
  		}
  	}
  
-@@ -4722,6 +6931,16 @@
+@@ -4722,6 +6963,16 @@ static int unload_module(void)
  		pthread_kill(discovery_thread, SIGURG);
  		pthread_join(discovery_thread, NULL);
  	}
@@ -3085,7 +3145,7 @@ the tree addons/ directory.
  
  	/* stop the sco listener threads */
  	AST_RWLIST_WRLOCK(&adapters);
-@@ -4747,6 +6966,9 @@
+@@ -4747,6 +6998,9 @@ static int unload_module(void)
  		if (pvt->hfp) {
  			ast_free(pvt->hfp);
  		}
@@ -3095,7 +3155,7 @@ the tree addons/ directory.
  
  		ast_smoother_free(pvt->bt_out_smoother);
  		ast_smoother_free(pvt->bt_in_smoother);
-@@ -4784,7 +7006,12 @@
+@@ -4784,7 +7038,12 @@ static int load_module(void)
  		return AST_MODULE_LOAD_DECLINE;
  	}
  
@@ -3109,7 +3169,7 @@ the tree addons/ directory.
  	/* Check if we have Bluetooth, no point loading otherwise... */
  	dev_id = hci_get_route(NULL);
  
-@@ -4807,6 +7034,18 @@
+@@ -4807,6 +7066,18 @@ static int load_module(void)
  	}
  
  	sdp_session = sdp_register();
@@ -3128,15 +3188,3 @@ the tree addons/ directory.
  
  	/* Spin the discovery thread */
  	if (ast_pthread_create_background(&discovery_thread, NULL, do_discovery, NULL) < 0) {
---- a/addons/Makefile
-+++ b/addons/Makefile
-@@ -58,6 +58,9 @@
- include $(ASTTOPDIR)/Makefile.moddir_rules
- 
- chan_mobile.o: _ASTCFLAGS+=$(AST_NO_FORMAT_TRUNCATION)
-+SBC_LIB?=-lsbc
-+chan_mobile.so: LIBS+=$(SBC_LIB) $(LC3_LIB)
-+$(call MOD_ADD_C,chan_mobile,chan_mobile_msbc.c chan_mobile_leaudio.c chan_mobile_lecall.c)
- chan_ooh323.so: _ASTCFLAGS+=$(H323CFLAGS)
- $(call MOD_ADD_C,chan_ooh323,$(H323SOURCE))
- 

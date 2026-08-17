@@ -9,10 +9,31 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CM_LE_CALL_VERSION 1
+/*
+ * Version 2 carries the caller identity on incoming state messages.  There is
+ * no negotiation: a version 1 peer rejects the header outright, so both halves
+ * have to be replaced together and a mismatch fails loudly rather than losing
+ * identities in silence.
+ */
+#define CM_LE_CALL_VERSION 2
 #define CM_LE_CALL_PACKET_SIZE 128
 #define CM_LE_CALL_PAYLOAD_SIZE 78
 #define CM_LE_CALL_SOCKET_MAX 107
+
+/*
+ * Caller identity inside a state payload:
+ *
+ *   [0]         uri length   0..CM_LE_CALL_URI_MAX
+ *   [1 .. n]    uri          scheme stripped by the peer
+ *   [1+n]       name length  0..CM_LE_CALL_NAME_MAX
+ *   [2+n .. ]   name         UTF-8, already cut on a character boundary
+ *
+ * 1 + 32 + 1 + 44 is exactly CM_LE_CALL_PAYLOAD_SIZE.  An absent number means
+ * it was withheld; an absent name means the caller is not in the phone's
+ * contacts, which is the common case and not an error.
+ */
+#define CM_LE_CALL_URI_MAX 32
+#define CM_LE_CALL_NAME_MAX 44
 
 #define CM_LE_CALL_FLAG_SNAPSHOT (1U << 0)
 #define CM_LE_CALL_FLAG_LAST (1U << 1)
@@ -76,6 +97,18 @@ int cm_le_call_encode(const struct cm_le_call_message *message,
 int cm_le_call_decode(const uint8_t *packet, size_t packet_length,
 	struct cm_le_call_message *message);
 int cm_le_call_valid_uri(const uint8_t *uri, size_t length);
+
+struct cm_le_call_identity {
+	char uri[CM_LE_CALL_URI_MAX + 1];
+	char name[CM_LE_CALL_NAME_MAX + 1];
+};
+
+/*
+ * Read a caller identity out of a state payload.  An empty payload yields an
+ * empty identity and success: a call with no caller ID is ordinary.
+ */
+int cm_le_call_parse_identity(const uint8_t *payload, size_t length,
+	struct cm_le_call_identity *identity);
 int cm_le_call_device_equal(const char *left, const char *right);
 
 int cm_le_call_connect(const char *path);
