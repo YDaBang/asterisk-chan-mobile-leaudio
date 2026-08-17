@@ -6,6 +6,8 @@ This adds a second transport: the phone's LE Audio unicast stream — LC3, 32 kH
 10 ms frames, 80 octets — reaches Asterisk as `slin32`, and call control moves
 from HFP AT commands to GTBS.
 
+*한국어: [README.ko.md](README.ko.md)*
+
 Against Asterisk 22.9.0.  The classic paths are untouched and still selected by
 default; the LE transport is opt-in per device.
 
