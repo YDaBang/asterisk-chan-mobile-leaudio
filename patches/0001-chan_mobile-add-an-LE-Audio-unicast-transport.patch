@@ -1,0 +1,3108 @@
+chan_mobile: add an LE Audio unicast transport
+
+Diff against Asterisk 22.9.0.  Apply from the top of an Asterisk tree
+with "patch -p1", then copy this repository addons/*.[ch] files into
+the tree addons/ directory.
+
+--- a/addons/chan_mobile.c
++++ b/addons/chan_mobile.c
+@@ -42,6 +42,8 @@
+ 
+ #include "asterisk.h"
+ 
++#include <inttypes.h>
++#include <poll.h>
+ #include <pthread.h>
+ #include <signal.h>
+ 
+@@ -54,6 +56,10 @@
+ #include <bluetooth/sco.h>
+ #include <bluetooth/l2cap.h>
+ 
++#include "chan_mobile_msbc.h"
++#include "chan_mobile_leaudio.h"
++#include "chan_mobile_lecall.h"
++
+ #include "asterisk/compat.h"
+ #include "asterisk/lock.h"
+ #include "asterisk/callerid.h"
+@@ -78,15 +84,97 @@
+ #define MBL_CONFIG "chan_mobile.conf"
+ #define MBL_CONFIG_OLD "mobile.conf"
+ 
+-#define DEVICE_FRAME_SIZE 48
+-#define DEVICE_FRAME_FORMAT ast_format_slin
+-#define CHANNEL_FRAME_SIZE 80
++#define CVSD_DEVICE_FRAME_SIZE 48
++#define CVSD_CHANNEL_FRAME_SIZE 80
++#define MSBC_CHANNEL_FRAME_SIZE 160
++#define SCO_RAW_BUFFER_SIZE 512
++#define AUDIO_IO_BUFFER_SIZE 16384
++#define MBL_LE_AUDIO_SOCKET_DEFAULT "/run/asterisk-leaudio/leaudio.sock"
++#define MBL_LE_AUDIO_SOCKET_MAX 107
++#define MBL_LE_CALL_SOCKET_DEFAULT "/run/asterisk-leaudio/lecall.sock"
++
++#define HFP_CODEC_CVSD 1
++#define HFP_CODEC_MSBC 2
++
++#ifndef BT_COMPID_REALTEK
++#define BT_COMPID_REALTEK 0x005d
++#endif
++#ifndef BT_COMPID_MEDIATEK
++#define BT_COMPID_MEDIATEK 0x0046
++#endif
++#ifndef BT_VOICE_TRANSPARENT
++#define BT_VOICE_TRANSPARENT 0x0003
++#endif
++
++enum mbl_audio_codec {
++	MBL_AUDIO_CVSD = HFP_CODEC_CVSD,
++	MBL_AUDIO_MSBC = HFP_CODEC_MSBC,
++};
++
++enum mbl_audio_transport {
++	MBL_AUDIO_TRANSPORT_CLASSIC = 0,
++	MBL_AUDIO_TRANSPORT_LE_CANARY,
++};
++
++enum mbl_call_audio_transport {
++	MBL_CALL_AUDIO_CLASSIC = 0,
++	MBL_CALL_AUDIO_LE_PENDING,
++	MBL_CALL_AUDIO_LE,
++	MBL_CALL_AUDIO_LE_FAILED,
++};
++
++enum mbl_call_control {
++	MBL_CALL_CONTROL_CLASSIC = 0,
++	MBL_CALL_CONTROL_LE_GTBS,
++};
++
++enum mbl_audio_write_result {
++	MBL_AUDIO_WRITE_OK = 0,
++	MBL_AUDIO_WRITE_FATAL = -1,
++	MBL_AUDIO_WRITE_SCO_FAILURE = -2,
++};
++
++enum mbl_msbc_stats_reason {
++	MBL_MSBC_STATS_HANGUP,
++	MBL_MSBC_STATS_RFCOMM_DISCONNECT,
++	MBL_MSBC_STATS_SUPERSEDED,
++};
++
++struct mbl_msbc_call_stats {
++	struct cm_msbc_rx_stats rx;
++	uint64_t tx_pcm_frames;
++	uint64_t tx_encoded_frames;
++	uint64_t tx_encode_failures;
++	uint64_t tx_packetizer_enobufs;
++	uint64_t tx_packetizer_invalid;
++	uint64_t tx_smoother_failures;
++	uint64_t sco_links;
++	uint64_t sco_rx_bytes;
++	uint64_t sco_read_failures;
++	uint64_t sco_tx_packets;
++	uint64_t sco_tx_bytes;
++	uint64_t sco_write_failures;
++	uint64_t preanswer_sco_drops;
++	unsigned int active:1;
++	unsigned int used_msbc:1;
++};
+ 
+ static int discovery_interval = 60;			/* The device discovery interval, default 60 seconds. */
+ static pthread_t discovery_thread = AST_PTHREADT_NULL;	/* The discovery thread */
++static pthread_t leaudio_thread = AST_PTHREADT_NULL;
++static pthread_t lecall_thread = AST_PTHREADT_NULL;
++static int leaudio_enabled;
++static int lecall_enabled;
++static char leaudio_socket_path[MBL_LE_AUDIO_SOCKET_MAX + 1] =
++	MBL_LE_AUDIO_SOCKET_DEFAULT;
++static char lecall_socket_path[CM_LE_CALL_SOCKET_MAX + 1] =
++	MBL_LE_CALL_SOCKET_DEFAULT;
++static int lecall_socket = -1;
++static uint64_t lecall_command_sequence = 1;
+ static sdp_session_t *sdp_session;
+ 
+ AST_MUTEX_DEFINE_STATIC(unload_mutex);
++AST_MUTEX_DEFINE_STATIC(lecall_socket_mutex);
+ static int unloading_flag = 0;
+ static inline int check_unloading(void);
+ static inline void set_unloading(void);
+@@ -108,6 +196,11 @@
+ 	int *sco_id;					/*!< the io context id of the sco listener socket */
+ 	int sco_socket;					/*!< sco listener socket */
+ 	pthread_t sco_listener_thread;			/*!< sco listener thread */
++	unsigned int deferred_setup:1;			/*!< BT_DEFER_SETUP enabled */
++	unsigned int controller_sco_mtu;			/*!< HCI controller SCO MTU */
++	unsigned int usb_transport:1;			/*!< adapter is connected over USB */
++	unsigned int realtek:1;				/*!< adapter manufacturer is Realtek */
++	unsigned int mediatek:1;				/*!< adapter manufacturer is MediaTek */
+ 	AST_LIST_ENTRY(adapter_pvt) entry;
+ };
+ 
+@@ -131,10 +224,48 @@
+ 	int rfcomm_port;				/* rfcomm port number */
+ 	int rfcomm_socket;				/* rfcomm socket descriptor */
+ 	char rfcomm_buf[256];
+-	char io_buf[CHANNEL_FRAME_SIZE + AST_FRIENDLY_OFFSET];
++	char io_buf[AUDIO_IO_BUFFER_SIZE + AST_FRIENDLY_OFFSET];
+ 	struct ast_smoother *bt_out_smoother;			/* our bt_out_smoother, for making 48 byte frames */
+ 	struct ast_smoother *bt_in_smoother;			/* our smoother, for making "normal" CHANNEL_FRAME_SIZEed byte frames */
+ 	int sco_socket;					/* sco socket descriptor */
++	enum mbl_audio_codec audio_codec;			/*!< codec selected by +BCS */
++	enum mbl_audio_transport audio_transport;		/*!< requested media transport */
++	enum mbl_call_audio_transport call_audio_transport;	/*!< sticky per-call media path */
++	enum mbl_call_control call_control;			/*!< HFP or remote GTBS */
++	struct cm_leaudio leaudio;
++	struct cm_leaudio_session_id leaudio_session;
++	struct ast_channel *leaudio_session_owner;
++	uint64_t lecall_token;
++	uint64_t lecall_snapshot_sequence;
++	uint64_t lecall_build_sequence;
++	uint64_t lecall_build_token;
++	uint64_t lecall_pending_sequence;
++	uint64_t lecall_suppressed_token;
++	uint8_t lecall_index;
++	uint8_t lecall_state;
++	uint8_t lecall_flags;
++	uint8_t lecall_build_index;
++	uint8_t lecall_build_state;
++	uint8_t lecall_build_flags;
++	uint8_t lecall_pending_opcode;
++	unsigned int lecall_ready:1;
++	unsigned int lecall_build_has_call:1;
++	unsigned int lecall_build_ambiguous:1;
++	unsigned int lecall_local_answer_requested:1;
++	unsigned int lecall_remote_ended:1;
++	unsigned int leaudio_stats_reported:1;
++	unsigned int leaudio_session_valid:1;
++	unsigned int wideband_requested:1;			/*!< config requests HFP WBS */
++	unsigned int wideband_capable:1;			/*!< BAC completed with capable AG */
++	unsigned int msbc_initialized:1;			/*!< codec state initialized */
++	unsigned int cvsd_carry_valid:1;			/*!< one CVSD byte is buffered */
++	unsigned int sco_mtu;				/*!< effective SCO write MTU */
++	uint8_t cvsd_carry;
++	uint8_t deferred_data[SCO_RAW_BUFFER_SIZE];
++	size_t deferred_length;
++	struct cm_msbc_tx_packetizer msbc_tx;
++	struct cm_msbc msbc;
++	struct mbl_msbc_call_stats msbc_stats;
+ 	pthread_t monitor_thread;			/* monitor thread handle */
+ 	int timeout;					/*!< used to set the timeout for rfcomm data (may be used in the future) */
+ 	unsigned int no_callsetup:1;
+@@ -159,6 +290,7 @@
+ 	unsigned int needring:1;	/*!< we need to send a RING */
+ 	unsigned int answered:1;	/*!< we sent/received an answer */
+ 	unsigned int connected:1;	/*!< do we have an rfcomm connection to a device */
++	unsigned int preanswer_sco_drop_logged:1;	/*!< did we log an early SCO TX drop */
+ 
+ 	AST_LIST_ENTRY(mbl_pvt) entry;
+ };
+@@ -215,7 +347,8 @@
+ "  Message - text of the message\n";
+ 
+ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinfo *cidinfo,
+-		const struct ast_assigned_ids *assignedids, const struct ast_channel *requestor);
++		const struct ast_assigned_ids *assignedids, const struct ast_channel *requestor,
++		struct ast_format *requested_format);
+ static struct ast_channel *mbl_request(const char *type, struct ast_format_cap *cap,
+ 		const struct ast_assigned_ids *assignedids, const struct ast_channel *requestor, const char *data, int *cause);
+ static int mbl_call(struct ast_channel *ast, const char *dest, int timeout);
+@@ -233,6 +366,18 @@
+ static int mbl_queue_hangup(struct mbl_pvt *pvt);
+ static int mbl_ast_hangup(struct mbl_pvt *pvt);
+ static int mbl_has_service(struct mbl_pvt *pvt);
++static void *do_leaudio_handoff(void *data);
++static void *do_lecall_control(void *data);
++static struct ast_format *mbl_leaudio_format(unsigned int sample_rate);
++static void mbl_leaudio_stats_report_locked(struct mbl_pvt *pvt,
++	const char *reason);
++static void mbl_leaudio_rx_fail_locked(struct mbl_pvt *pvt,
++	const char *stage, int result, int detail, int64_t sdu_length);
++static void mbl_leaudio_tx_fail_locked(struct mbl_pvt *pvt,
++	const char *stage, int result, int detail);
++static int mbl_lecall_available(const struct mbl_pvt *pvt);
++static int mbl_lecall_send_locked(struct mbl_pvt *pvt, uint8_t opcode,
++	const uint8_t *payload, size_t payload_length);
+ 
+ static int rfcomm_connect(bdaddr_t src, bdaddr_t dst, int remote_channel);
+ static int rfcomm_write(int rsock, char *buf);
+@@ -244,6 +389,8 @@
+ static int sco_write(int s, char *buf, int len);
+ static int sco_accept(int *id, int fd, short events, void *data);
+ static int sco_bind(struct adapter_pvt *adapter);
++static int sco_enable_deferred_setup(struct adapter_pvt *adapter);
++static unsigned int sco_effective_mtu(struct mbl_pvt *pvt, int sock);
+ 
+ static void *do_sco_listen(void *data);
+ static int sdp_search(char *addr, int profile);
+@@ -261,6 +408,8 @@
+ #define HFP_HF_VOLUME	(1 << 4)
+ #define HFP_HF_STATUS	(1 << 5)
+ #define HFP_HF_CONTROL	(1 << 6)
++#define HFP_HF_CODEC	(1 << 7)
++#define HFP_HF_ESCO	(1 << 9)
+ 
+ #define HFP_AG_CW	(1 << 0)
+ #define HFP_AG_ECNR	(1 << 1)
+@@ -271,6 +420,8 @@
+ #define HFP_AG_STATUS	(1 << 6)
+ #define HFP_AG_CONTROL	(1 << 7)
+ #define HFP_AG_ERRORS	(1 << 8)
++#define HFP_AG_CODEC	(1 << 9)
++#define HFP_AG_ESCO	(1 << 11)
+ 
+ #define HFP_CIND_UNKNOWN	-1
+ #define HFP_CIND_NONE		0
+@@ -307,6 +458,8 @@
+ 	int volume:1;	/*!< remote volume control */
+ 	int status:1;	/*!< enhanced call status */
+ 	int control:1;	/*!< enhanced call control*/
++	int codec:1;	/*!< codec negotiation */
++	int esco:1;	/*!< eSCO S4 settings */
+ };
+ 
+ /*!
+@@ -322,6 +475,8 @@
+ 	int status:1;	/*!< enhanced call status */
+ 	int control:1;	/*!< enhanced call control*/
+ 	int errors:1;	/*!< extended error result codes*/
++	int codec:1;	/*!< codec negotiation */
++	int esco:1;	/*!< eSCO S4 settings */
+ };
+ 
+ /*!
+@@ -366,6 +521,8 @@
+ 	.volume = 0,
+ 	.status = 0,
+ 	.control = 0,
++	.codec = 0,
++	.esco = 0,
+ };
+ 
+ 
+@@ -375,6 +532,7 @@
+ static int hfp_parse_cmti(struct hfp_pvt *hfp, char *buf);
+ static int hfp_parse_cmgr(struct hfp_pvt *hfp, char *buf, char **from_number, char **text);
+ static int hfp_parse_brsf(struct hfp_pvt *hfp, const char *buf);
++static int hfp_parse_bcs(const char *buf, int *codec);
+ static int hfp_parse_cind(struct hfp_pvt *hfp, char *buf);
+ static int hfp_parse_cind_test(struct hfp_pvt *hfp, char *buf);
+ static char *hfp_parse_cusd(struct hfp_pvt *hfp, char *buf);
+@@ -383,6 +541,8 @@
+ static struct hfp_ag *hfp_int2brsf(int brsf, struct hfp_ag *ag);
+ 
+ static int hfp_send_brsf(struct hfp_pvt *hfp, struct hfp_hf *brsf);
++static int hfp_send_bac(struct hfp_pvt *hfp, int wideband);
++static int hfp_send_bcs(struct hfp_pvt *hfp, int codec);
+ static int hfp_send_cind(struct hfp_pvt *hfp);
+ static int hfp_send_cind_test(struct hfp_pvt *hfp);
+ static int hfp_send_cmer(struct hfp_pvt *hfp, int status);
+@@ -426,6 +586,7 @@
+ 	AT_ERROR,
+ 	AT_RING,
+ 	AT_BRSF,
++	AT_BCS,
+ 	AT_CIND,
+ 	AT_CIEV,
+ 	AT_CLIP,
+@@ -445,6 +606,7 @@
+ 	AT_CMGF,
+ 	AT_CNMI,
+ 	AT_CMER,
++	AT_BAC,
+ 	AT_CIND_TEST,
+ 	AT_CUSD,
+ 	AT_BUSY,
+@@ -517,16 +679,29 @@
+ 	ast_cli(a->fd, FORMAT1, "ID", "Address", "Group", "Adapter", "Connected", "State", "SMS");
+ 	AST_RWLIST_RDLOCK(&devices);
+ 	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
+-		ast_mutex_lock(&pvt->lock);
++		int available;
++
+ 		ba2str(&pvt->addr, bdaddr);
+ 		snprintf(group, sizeof(group), "%d", pvt->group);
++		if (ast_mutex_trylock(&pvt->lock)) {
++			ast_cli(a->fd, FORMAT1,
++				pvt->id,
++				bdaddr,
++				group,
++				pvt->adapter->id,
++				"Busy",
++				"Retry",
++				"No");
++			continue;
++		}
++		available = mbl_lecall_available(pvt);
+ 		ast_cli(a->fd, FORMAT1,
+ 				pvt->id,
+ 				bdaddr,
+ 				group,
+ 				pvt->adapter->id,
+-				pvt->connected ? "Yes" : "No",
+-				(!pvt->connected) ? "None" : (pvt->owner) ? "Busy" : (pvt->outgoing_sms || pvt->incoming_sms) ? "SMS" : (mbl_has_service(pvt)) ? "Free" : "No Service",
++				available ? "Yes" : "No",
++				(!available) ? "None" : (pvt->owner) ? "Busy" : (pvt->outgoing_sms || pvt->incoming_sms) ? "SMS" : (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS || mbl_has_service(pvt)) ? "Free" : "No Service",
+ 				(pvt->has_sms) ? "Yes" : "No"
+ 		       );
+ 		ast_mutex_unlock(&pvt->lock);
+@@ -746,7 +921,7 @@
+ 
+ 	if (pvt) {
+ 		ast_mutex_lock(&pvt->lock);
+-		if (pvt->connected)
++		if (mbl_lecall_available(pvt))
+ 			stat = 2;
+ 		if (pvt->owner)
+ 			stat = 3;
+@@ -844,12 +1019,454 @@
+ 
+ */
+ 
++static void mbl_stats_add(uint64_t *value, uint64_t increment)
++{
++	if (UINT64_MAX - *value < increment)
++		*value = UINT64_MAX;
++	else
++		*value += increment;
++}
++
++static void mbl_stats_inc(uint64_t *value)
++{
++	mbl_stats_add(value, 1);
++}
++
++static const char *mbl_msbc_stats_reason_name(enum mbl_msbc_stats_reason reason)
++{
++	switch (reason) {
++	case MBL_MSBC_STATS_HANGUP:
++		return "hangup";
++	case MBL_MSBC_STATS_RFCOMM_DISCONNECT:
++		return "rfcomm-disconnect";
++	case MBL_MSBC_STATS_SUPERSEDED:
++		return "superseded";
++	}
++	return "unknown";
++}
++
++/*
++ * The caller holds pvt->lock. Emit one fixed-schema summary containing only
++ * aggregate counters. In particular, do not add channel, call, phone,
++ * Bluetooth, SIP, or audio identifiers to this line.
++ */
++static void mbl_msbc_stats_report_locked(struct mbl_pvt *pvt,
++	enum mbl_msbc_stats_reason reason)
++{
++	struct mbl_msbc_call_stats *stats = &pvt->msbc_stats;
++
++	if (!stats->active)
++		return;
++
++	cm_msbc_set_rx_stats(&pvt->msbc, NULL);
++	if (!stats->used_msbc) {
++		memset(stats, 0, sizeof(*stats));
++		return;
++	}
++	ast_log(LOG_NOTICE,
++		"MSBC_CALL_STATS v=1 reason=%s "
++		"rx_feed_bytes=%" PRIu64 " rx_good=%" PRIu64 " "
++		"rx_gap_events=%" PRIu64 " rx_gap_frames=%" PRIu64 " "
++		"rx_decode_fail=%" PRIu64 " rx_resync=%" PRIu64 " "
++		"rx_discard_bytes=%" PRIu64 " rx_concealed=%" PRIu64 " "
++		"plc_substitution=%" PRIu64 " plc_zir=%" PRIu64 " "
++		"plc_decoder_reinit=%" PRIu64 " "
++		"plc_zero_decode_fail=%" PRIu64 " "
++		"rx_enobufs=%" PRIu64 " rx_enospc=%" PRIu64 " "
++		"tx_pcm_frames=%" PRIu64 " tx_encoded_frames=%" PRIu64 " "
++		"tx_encode_fail=%" PRIu64 " "
++		"tx_packetizer_enobufs=%" PRIu64 " "
++		"tx_packetizer_invalid=%" PRIu64 " "
++		"tx_smoother_fail=%" PRIu64 " sco_links=%" PRIu64 " "
++		"sco_rx_bytes=%" PRIu64 " sco_read_fail=%" PRIu64 " "
++		"sco_tx_packets=%" PRIu64 " sco_tx_bytes=%" PRIu64 " "
++		"sco_tx_fail=%" PRIu64 " preanswer_drop=%" PRIu64 "\n",
++		mbl_msbc_stats_reason_name(reason),
++		stats->rx.feed_bytes, stats->rx.good_frames,
++		stats->rx.seq_gap_events, stats->rx.seq_gap_frames,
++		stats->rx.decode_failures, stats->rx.h2_resync_events,
++		stats->rx.h2_discarded_bytes, stats->rx.concealed_frames,
++		stats->rx.plc_substitution_frames, stats->rx.plc_zir_frames,
++		stats->rx.plc_decoder_reinits,
++		stats->rx.plc_zero_decode_failures,
++		stats->rx.enobufs, stats->rx.enospc,
++		stats->tx_pcm_frames, stats->tx_encoded_frames,
++		stats->tx_encode_failures, stats->tx_packetizer_enobufs,
++		stats->tx_packetizer_invalid, stats->tx_smoother_failures,
++		stats->sco_links, stats->sco_rx_bytes,
++		stats->sco_read_failures, stats->sco_tx_packets,
++		stats->sco_tx_bytes, stats->sco_write_failures,
++		stats->preanswer_sco_drops);
++	memset(stats, 0, sizeof(*stats));
++}
++
++/* The caller holds pvt->lock and has just created a voice channel. */
++static void mbl_msbc_stats_begin_locked(struct mbl_pvt *pvt)
++{
++	struct mbl_msbc_call_stats *stats = &pvt->msbc_stats;
++
++	if (stats->active)
++		mbl_msbc_stats_report_locked(pvt, MBL_MSBC_STATS_SUPERSEDED);
++	if (pvt->type != MBL_TYPE_PHONE ||
++		(!pvt->wideband_requested && !pvt->wideband_capable))
++		return;
++
++	memset(stats, 0, sizeof(*stats));
++	stats->active = 1;
++	cm_msbc_set_rx_stats(&pvt->msbc, NULL);
++	if (pvt->audio_codec == MBL_AUDIO_MSBC && pvt->sco_socket != -1) {
++		stats->used_msbc = 1;
++		stats->sco_links = 1;
++		cm_msbc_set_rx_stats(&pvt->msbc, &stats->rx);
++	}
++}
++
++static struct ast_format *mbl_leaudio_format(unsigned int sample_rate)
++{
++	switch (sample_rate) {
++	case 16000:
++		return ast_format_slin16;
++	case 24000:
++		return ast_format_slin24;
++	case 32000:
++		return ast_format_slin32;
++	default:
++		return NULL;
++	}
++}
++
++/* The caller holds pvt->lock. The channel pointer and media generations form
++ * one immutable I/O capability. A later channel may reuse the same numeric fd,
++ * but an older callback cannot pass both parts of this check. */
++static void mbl_leaudio_session_clear_locked(struct mbl_pvt *pvt)
++{
++	memset(&pvt->leaudio_session, 0, sizeof(pvt->leaudio_session));
++	pvt->leaudio_session_owner = NULL;
++	pvt->leaudio_session_valid = 0;
++}
++
++static int mbl_leaudio_session_capture_locked(struct mbl_pvt *pvt,
++	struct ast_channel *owner)
++{
++	struct cm_leaudio_session_id session;
++
++	if (!pvt || !owner || owner != pvt->owner ||
++		cm_leaudio_get_session_id(&pvt->leaudio, &session) < 0) {
++		if (pvt)
++			mbl_leaudio_session_clear_locked(pvt);
++		return -ESTALE;
++	}
++	pvt->leaudio_session = session;
++	pvt->leaudio_session_owner = owner;
++	pvt->leaudio_session_valid = 1;
++	return 0;
++}
++
++static void mbl_leaudio_end_locked(struct mbl_pvt *pvt)
++{
++	mbl_leaudio_session_clear_locked(pvt);
++	cm_leaudio_end(&pvt->leaudio);
++}
++
++/* The caller holds pvt->lock. The report is emitted once per activated media
++ * pair and contains only aggregate I/O state, never audio or identifiers from
++ * the call signaling payload. */
++static void mbl_leaudio_stats_report_locked(struct mbl_pvt *pvt,
++	const char *reason)
++{
++	const struct cm_leaudio_io_stats *stats;
++
++	if (pvt->leaudio_stats_reported)
++		return;
++	stats = cm_leaudio_get_io_stats(&pvt->leaudio);
++	if (!stats)
++		return;
++	if (!pvt->leaudio.active && stats->read_calls == 0 &&
++		stats->write_calls == 0)
++		return;
++	ast_log(LOG_NOTICE,
++		"[%s] LE_AUDIO_IO_STATS reason=%s "
++		"read_calls=%" PRIu64 " read_retries=%" PRIu64 " poll_hups=%" PRIu64 " poll_errors=%" PRIu64 " empty_sdus=%" PRIu64 " consecutive_empty_sdus=%" PRIu64 " max_consecutive_empty_sdus=%" PRIu64 " guarded_consecutive_empty_sdus=%" PRIu64 " empty_sdu_guard_arms=%" PRIu64 " empty_sdu_guard_progress_resets=%" PRIu64 " empty_sdu_guard_trips=%" PRIu64 " stale_rx_session_rejections=%" PRIu64 " stale_tx_session_rejections=%" PRIu64 " lifecycle_progress_attempts=%" PRIu64 " lifecycle_progress_successes=%" PRIu64 " lifecycle_progress_errors=%" PRIu64 " lifecycle_normal_end_attempts=%" PRIu64 " lifecycle_normal_end_successes=%" PRIu64 " lifecycle_normal_end_errors=%" PRIu64 " short_sdus=%" PRIu64 " full_sdus=%" PRIu64 " truncated_sdus=%" PRIu64 " packet_status_errors=%" PRIu64 " receive_errors=%" PRIu64 " "
++		"decode_calls=%" PRIu64 " decode_successes=%" PRIu64 " decode_plc=%" PRIu64 " prehistory_silence=%" PRIu64 " decode_errors=%" PRIu64 " "
++		"write_calls=%" PRIu64 " encode_calls=%" PRIu64 " encode_successes=%" PRIu64 " encode_errors=%" PRIu64 " send_calls=%" PRIu64 " send_successes=%" PRIu64 " send_retries=%" PRIu64 " send_errors=%" PRIu64 " "
++		"first_error_stage=%s first_error_result=%d first_error_detail=%d first_error_sdu_length=%" PRId64 "\n",
++		pvt->id, reason ? reason : "unspecified",
++		stats->read_calls, stats->read_retries, stats->poll_hups,
++		stats->poll_errors, stats->empty_sdus,
++			stats->consecutive_empty_sdus,
++			stats->max_consecutive_empty_sdus,
++			stats->guarded_consecutive_empty_sdus,
++			stats->empty_sdu_guard_arms,
++			stats->empty_sdu_guard_progress_resets,
++			stats->empty_sdu_guard_trips,
++		stats->stale_rx_session_rejections,
++		stats->stale_tx_session_rejections,
++		stats->lifecycle_progress_attempts,
++		stats->lifecycle_progress_successes,
++		stats->lifecycle_progress_errors,
++		stats->lifecycle_normal_end_attempts,
++		stats->lifecycle_normal_end_successes,
++		stats->lifecycle_normal_end_errors, stats->short_sdus,
++		stats->full_sdus, stats->truncated_sdus,
++		stats->packet_status_errors, stats->receive_errors,
++		stats->decode_calls, stats->decode_successes,
++		stats->decode_plc_frames, stats->prehistory_silence_frames,
++		stats->decode_errors,
++		stats->write_calls, stats->encode_calls,
++		stats->encode_successes, stats->encode_errors,
++		stats->send_calls, stats->send_successes,
++		stats->send_retries, stats->send_errors,
++		cm_leaudio_io_stage_name(stats->first_error_stage),
++		stats->first_error_result, stats->first_error_detail,
++		stats->first_error_sdu_length);
++	pvt->leaudio_stats_reported = 1;
++}
++
++/* The caller holds pvt->lock. A terminal media error ends the complete linked
++ * CIS session. Keeping only one direction alive leaves the Go D-Bus owner and
++ * BlueZ MediaTransport active, which prevents the next call from acquiring. */
++static void mbl_leaudio_fail_locked(struct mbl_pvt *pvt,
++	const char *direction, const char *stage, int result, int detail,
++	int64_t sdu_length)
++{
++	unsigned int rx_active;
++	unsigned int tx_active;
++
++	if (pvt->call_audio_transport != MBL_CALL_AUDIO_LE)
++		return;
++	rx_active = (unsigned int) cm_leaudio_rx_active(&pvt->leaudio);
++	tx_active = (unsigned int) cm_leaudio_tx_active(&pvt->leaudio);
++	if (pvt->owner)
++		ast_channel_set_fd(pvt->owner, 0, -1);
++	ast_log(LOG_WARNING,
++		"[%s] LE_AUDIO_IO_ERROR direction=%s stage=%s result=%d detail=%d sdu_length=%" PRId64 " rx_active=%u tx_active=%u action=bilateral-teardown\n",
++		pvt->id, direction ? direction : "unknown",
++		stage ? stage : "unknown", result, detail, sdu_length,
++		rx_active, tx_active);
++	mbl_leaudio_stats_report_locked(pvt, "terminal-media-error");
++	mbl_leaudio_end_locked(pvt);
++	pvt->call_audio_transport = MBL_CALL_AUDIO_LE_FAILED;
++	if (pvt->owner)
++		mbl_queue_hangup(pvt);
++}
++
++static void mbl_leaudio_rx_fail_locked(struct mbl_pvt *pvt,
++	const char *stage, int result, int detail, int64_t sdu_length)
++{
++	mbl_leaudio_fail_locked(pvt, "rx", stage, result, detail, sdu_length);
++}
++
++static void mbl_leaudio_tx_fail_locked(struct mbl_pvt *pvt,
++	const char *stage, int result, int detail)
++{
++	mbl_leaudio_fail_locked(pvt, "tx", stage, result, detail, -1);
++}
++
++static int mbl_lecall_available(const struct mbl_pvt *pvt)
++{
++	if (!pvt)
++		return 0;
++	return pvt->call_control == MBL_CALL_CONTROL_LE_GTBS ?
++		pvt->lecall_ready : pvt->connected;
++}
++
++/* The caller holds pvt->lock. */
++static int mbl_lecall_send_locked(struct mbl_pvt *pvt, uint8_t opcode,
++	const uint8_t *payload, size_t payload_length)
++{
++	struct cm_le_call_message message;
++	char address[18];
++	int result;
++
++	if (!pvt || pvt->call_control != MBL_CALL_CONTROL_LE_GTBS ||
++		!pvt->lecall_ready)
++		return -ENOTCONN;
++	memset(&message, 0, sizeof(message));
++	message.type = CM_LE_CALL_COMMAND;
++	message.code = opcode;
++	ba2str(&pvt->addr, address);
++	ast_copy_string(message.device, address, sizeof(message.device));
++	if (opcode == CM_LE_CALL_ORIGINATE) {
++		if (!payload || payload_length > sizeof(message.payload))
++			return -EINVAL;
++		message.payload_length = (uint16_t) payload_length;
++		memcpy(message.payload, payload, payload_length);
++	} else {
++		if (payload_length != 0 || pvt->lecall_index == 0 ||
++			pvt->lecall_token == 0)
++			return -ESTALE;
++		message.index = pvt->lecall_index;
++		message.token = pvt->lecall_token;
++	}
++
++	ast_mutex_lock(&lecall_socket_mutex);
++	if (lecall_socket < 0) {
++		result = -ENOTCONN;
++	} else {
++		if (++lecall_command_sequence == 0)
++			++lecall_command_sequence;
++		message.sequence = lecall_command_sequence;
++		result = cm_le_call_send(lecall_socket, &message);
++	}
++	ast_mutex_unlock(&lecall_socket_mutex);
++	if (result == 0) {
++		pvt->lecall_pending_sequence = message.sequence;
++		pvt->lecall_pending_opcode = opcode;
++	}
++	return result;
++}
++
++/* The caller holds pvt->lock and the owner channel lock. Media activation
++ * never changes call state. */
++static int mbl_leaudio_activate_channel_locked(struct mbl_pvt *pvt)
++{
++	struct ast_format_cap *native_cap = NULL;
++	struct ast_format *raw_format;
++	struct ast_dsp *new_dsp = NULL;
++	int samples;
++	int result = -EINVAL;
++
++	if (!pvt->owner || pvt->call_control != MBL_CALL_CONTROL_LE_GTBS ||
++		pvt->lecall_token == 0 || !cm_leaudio_ready(&pvt->leaudio))
++		return -EAGAIN;
++	if (!pvt->leaudio.sink.call_control_correlated ||
++		pvt->leaudio.sink.call_control_token != pvt->lecall_token ||
++		pvt->leaudio.source.call_control_token != pvt->lecall_token)
++		return -ESTALE;
++	if (cm_leaudio_begin(&pvt->leaudio) < 0)
++		return -EINVAL;
++	raw_format = mbl_leaudio_format(
++		(unsigned int) cm_leaudio_sample_rate(&pvt->leaudio));
++	samples = cm_leaudio_frame_samples(&pvt->leaudio);
++	if (!raw_format || samples <= 0)
++		goto fail;
++	new_dsp = ast_dsp_new_with_rate(
++		(unsigned int) cm_leaudio_sample_rate(&pvt->leaudio));
++	if (!new_dsp)
++		goto fail;
++	ast_dsp_set_features(new_dsp, DSP_FEATURE_DIGIT_DETECT);
++	ast_dsp_set_digitmode(new_dsp,
++		DSP_DIGITMODE_DTMF | DSP_DIGITMODE_RELAXDTMF);
++	native_cap = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT);
++	if (!native_cap || ast_format_cap_append(native_cap, raw_format, 0))
++		goto fail;
++	if (ast_set_read_format_path(pvt->owner, raw_format,
++		ast_channel_readformat(pvt->owner)) ||
++		ast_set_write_format_path(pvt->owner,
++			ast_channel_writeformat(pvt->owner), raw_format))
++		goto fail;
++	ast_channel_nativeformats_set(pvt->owner, native_cap);
++	ast_dsp_free(pvt->dsp);
++	pvt->dsp = new_dsp;
++	new_dsp = NULL;
++	ast_smoother_reset(pvt->bt_out_smoother,
++		samples * (int) sizeof(int16_t));
++	ast_smoother_reset(pvt->bt_in_smoother,
++		samples * (int) sizeof(int16_t));
++	ast_dsp_digitreset(pvt->dsp);
++	pvt->call_audio_transport = MBL_CALL_AUDIO_LE;
++	pvt->leaudio_stats_reported = 0;
++	if (mbl_leaudio_session_capture_locked(pvt, pvt->owner) < 0)
++		goto fail;
++	ast_channel_set_fd(pvt->owner, 0,
++		cm_leaudio_read_fd(&pvt->leaudio));
++	if (ast_channel_is_bridged(pvt->owner))
++		ast_channel_set_unbridged_nolock(pvt->owner, 1);
++	ast_log(LOG_NOTICE,
++		"[%s] correlated LE Audio activated rate=%d frame-us=%d token=%" PRIu64 "\n",
++		pvt->id, cm_leaudio_sample_rate(&pvt->leaudio),
++		cm_leaudio_frame_duration_us(&pvt->leaudio),
++		pvt->lecall_token);
++	result = 0;
++
++fail:
++	ao2_cleanup(native_cap);
++	if (new_dsp)
++		ast_dsp_free(new_dsp);
++	if (result != 0) {
++		mbl_leaudio_end_locked(pvt);
++		pvt->call_audio_transport = MBL_CALL_AUDIO_LE_FAILED;
++	}
++	return result;
++}
++
++/* The caller holds pvt->lock. Follow chan_mobile's established lock-order
++ * avoidance when an asynchronous GTBS or ISO event changes channel media. */
++static int mbl_leaudio_activate_locked(struct mbl_pvt *pvt)
++{
++	for (;;) {
++		struct ast_channel *owner = pvt->owner;
++		int result;
++
++		if (!owner)
++			return -EAGAIN;
++		if (ast_channel_trylock(owner)) {
++			DEADLOCK_AVOIDANCE(&pvt->lock);
++			continue;
++		}
++		if (owner != pvt->owner) {
++			ast_channel_unlock(owner);
++			continue;
++		}
++		result = mbl_leaudio_activate_channel_locked(pvt);
++		ast_channel_unlock(owner);
++		return result;
++	}
++}
++
++/* The caller holds pvt->lock and does not hold the owner channel lock. */
++static void mbl_leaudio_stop_locked(struct mbl_pvt *pvt,
++	enum mbl_call_audio_transport next_transport)
++{
++	for (;;) {
++		struct ast_channel *owner = pvt->owner;
++
++		if (!owner) {
++			mbl_leaudio_stats_report_locked(pvt, "transport-stop");
++			mbl_leaudio_end_locked(pvt);
++			pvt->call_audio_transport = next_transport;
++			return;
++		}
++		if (ast_channel_trylock(owner)) {
++			DEADLOCK_AVOIDANCE(&pvt->lock);
++			continue;
++		}
++		if (owner != pvt->owner) {
++			ast_channel_unlock(owner);
++			continue;
++		}
++		ast_channel_set_fd(owner, 0, -1);
++		mbl_leaudio_stats_report_locked(pvt, "transport-stop");
++		mbl_leaudio_end_locked(pvt);
++		pvt->call_audio_transport = next_transport;
++		ast_channel_unlock(owner);
++		return;
++	}
++}
++
+ static struct ast_channel *mbl_new(int state, struct mbl_pvt *pvt, struct cidinfo *cidinfo,
+-		const struct ast_assigned_ids *assignedids, const struct ast_channel *requestor)
++		const struct ast_assigned_ids *assignedids, const struct ast_channel *requestor,
++		struct ast_format *requested_format)
+ {
+ 	struct ast_channel *chn;
++	struct ast_dsp *new_dsp;
++	struct ast_format *raw_format;
++	struct ast_format *core_format;
++	struct ast_format_cap *native_cap;
++	unsigned int dsp_rate;
++	int output_frame_size;
++	int input_frame_size;
++	int leaudio_started = 0;
++	int leaudio_samples = 0;
+ 
+ 	pvt->answered = 0;
++	pvt->preanswer_sco_drop_logged = 0;
++	pvt->leaudio_stats_reported = 0;
++	pvt->lecall_local_answer_requested = 0;
++	pvt->lecall_remote_ended = 0;
++	pvt->call_audio_transport =
++		pvt->call_control == MBL_CALL_CONTROL_LE_GTBS ?
++		MBL_CALL_AUDIO_LE_PENDING : MBL_CALL_AUDIO_CLASSIC;
+ 	pvt->alignment_count = 0;
+ 	pvt->alignment_detection_triggered = 0;
+ 	if (pvt->adapter->alignment_detection)
+@@ -857,8 +1474,65 @@
+ 	else
+ 		pvt->do_alignment_detection = 0;
+ 
+-	ast_smoother_reset(pvt->bt_out_smoother, DEVICE_FRAME_SIZE);
+-	ast_smoother_reset(pvt->bt_in_smoother, CHANNEL_FRAME_SIZE);
++	if (pvt->call_control != MBL_CALL_CONTROL_LE_GTBS &&
++		pvt->audio_transport == MBL_AUDIO_TRANSPORT_LE_CANARY &&
++		cm_leaudio_ready(&pvt->leaudio) && cm_leaudio_begin(&pvt->leaudio) == 0) {
++		raw_format = mbl_leaudio_format(
++			(unsigned int) cm_leaudio_sample_rate(&pvt->leaudio));
++		leaudio_samples = cm_leaudio_frame_samples(&pvt->leaudio);
++		if (raw_format && leaudio_samples > 0) {
++			pvt->call_audio_transport = MBL_CALL_AUDIO_LE;
++			leaudio_started = 1;
++			ast_log(LOG_NOTICE,
++				"[%s] LE Audio canary selected for this call rate=%d frame-us=%d\n",
++				pvt->id, cm_leaudio_sample_rate(&pvt->leaudio),
++				cm_leaudio_frame_duration_us(&pvt->leaudio));
++		} else {
++			mbl_leaudio_end_locked(pvt);
++			raw_format = NULL;
++		}
++	} else {
++		raw_format = NULL;
++	}
++	if (!raw_format && pvt->call_control == MBL_CALL_CONTROL_LE_GTBS)
++		raw_format = ast_format_slin32;
++	if (!raw_format)
++		raw_format = pvt->wideband_capable ? ast_format_slin16 : ast_format_slin;
++	core_format = requested_format ? requested_format : raw_format;
++	dsp_rate = pvt->call_control == MBL_CALL_CONTROL_LE_GTBS ? 32000 :
++		leaudio_started ?
++		(unsigned int) cm_leaudio_sample_rate(&pvt->leaudio) :
++		(pvt->wideband_capable ? 16000 : 8000);
++	if (ast_dsp_get_sample_rate(pvt->dsp) != dsp_rate) {
++		new_dsp = ast_dsp_new_with_rate(dsp_rate);
++		if (!new_dsp) {
++			ast_log(LOG_ERROR, "[%s] cannot create %u Hz DSP\n", pvt->id,
++				dsp_rate);
++			goto e_return;
++		}
++		ast_dsp_set_features(new_dsp, DSP_FEATURE_DIGIT_DETECT);
++		ast_dsp_set_digitmode(new_dsp,
++			DSP_DIGITMODE_DTMF | DSP_DIGITMODE_RELAXDTMF);
++		ast_dsp_free(pvt->dsp);
++		pvt->dsp = new_dsp;
++	}
++	if (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS) {
++		output_frame_size = 320 *
++			(int) sizeof(int16_t);
++		input_frame_size = output_frame_size;
++	} else if (leaudio_started) {
++		output_frame_size = leaudio_samples * (int) sizeof(int16_t);
++		input_frame_size = output_frame_size;
++	} else {
++		output_frame_size = pvt->audio_codec == MBL_AUDIO_MSBC ?
++			CM_MSBC_PCM_BYTES :
++			(pvt->wideband_capable ? CVSD_DEVICE_FRAME_SIZE * 2 :
++			 CVSD_DEVICE_FRAME_SIZE);
++		input_frame_size = pvt->wideband_capable ? MSBC_CHANNEL_FRAME_SIZE :
++			CVSD_CHANNEL_FRAME_SIZE;
++	}
++	ast_smoother_reset(pvt->bt_out_smoother, output_frame_size);
++	ast_smoother_reset(pvt->bt_in_smoother, input_frame_size);
+ 	ast_dsp_digitreset(pvt->dsp);
+ 
+ 	chn = ast_channel_alloc(1, state,
+@@ -870,12 +1544,18 @@
+ 		goto e_return;
+ 	}
+ 
++	native_cap = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT);
++	if (!native_cap || ast_format_cap_append(native_cap, raw_format, 0) ||
++		ast_set_read_format_path(chn, raw_format, core_format) ||
++		ast_set_write_format_path(chn, core_format, raw_format)) {
++		ao2_cleanup(native_cap);
++		ast_channel_unlock(chn);
++		ast_hangup(chn);
++		goto e_return;
++	}
+ 	ast_channel_tech_set(chn, &mbl_tech);
+-	ast_channel_nativeformats_set(chn, mbl_tech.capabilities);
+-	ast_channel_set_rawreadformat(chn, DEVICE_FRAME_FORMAT);
+-	ast_channel_set_rawwriteformat(chn, DEVICE_FRAME_FORMAT);
+-	ast_channel_set_writeformat(chn, DEVICE_FRAME_FORMAT);
+-	ast_channel_set_readformat(chn, DEVICE_FRAME_FORMAT);
++	ast_channel_nativeformats_set(chn, native_cap);
++	ao2_cleanup(native_cap);
+ 	ast_channel_tech_pvt_set(chn, pvt);
+ 
+ 	if (state == AST_STATE_RING)
+@@ -883,8 +1563,23 @@
+ 
+ 	ast_channel_language_set(chn, "en");
+ 	pvt->owner = chn;
++	if (leaudio_started &&
++		mbl_leaudio_session_capture_locked(pvt, chn) < 0) {
++		mbl_leaudio_end_locked(pvt);
++		pvt->call_audio_transport = MBL_CALL_AUDIO_CLASSIC;
++		pvt->owner = NULL;
++		ast_channel_tech_pvt_set(chn, NULL);
++		ast_channel_unlock(chn);
++		ast_hangup(chn);
++		return NULL;
++	}
+ 
+-	if (pvt->sco_socket != -1) {
++	if (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS &&
++		mbl_leaudio_activate_channel_locked(pvt) == 0) {
++		/* The activation helper installed the correlated ISO read fd. */
++	} else if (leaudio_started) {
++		ast_channel_set_fd(chn, 0, cm_leaudio_read_fd(&pvt->leaudio));
++	} else if (pvt->sco_socket != -1) {
+ 		ast_channel_set_fd(chn, 0, pvt->sco_socket);
+ 	}
+ 	ast_channel_unlock(chn);
+@@ -892,6 +1587,10 @@
+ 	return chn;
+ 
+ e_return:
++	if (leaudio_started) {
++		mbl_leaudio_end_locked(pvt);
++		pvt->call_audio_transport = MBL_CALL_AUDIO_CLASSIC;
++	}
+ 	return NULL;
+ }
+ 
+@@ -911,7 +1610,10 @@
+ 		return NULL;
+ 	}
+ 
+-	if (ast_format_cap_iscompatible_format(cap, DEVICE_FRAME_FORMAT) == AST_FORMAT_CMP_NOT_EQUAL) {
++	if (ast_format_cap_iscompatible_format(cap, ast_format_slin) == AST_FORMAT_CMP_NOT_EQUAL &&
++		ast_format_cap_iscompatible_format(cap, ast_format_slin16) == AST_FORMAT_CMP_NOT_EQUAL &&
++		ast_format_cap_iscompatible_format(cap, ast_format_slin24) == AST_FORMAT_CMP_NOT_EQUAL &&
++		ast_format_cap_iscompatible_format(cap, ast_format_slin32) == AST_FORMAT_CMP_NOT_EQUAL) {
+ 		struct ast_str *codec_buf = ast_str_alloca(AST_FORMAT_CAP_NAMES_LEN);
+ 		ast_log(LOG_WARNING, "Asked to get a channel of unsupported format '%s'\n", ast_format_cap_get_names(cap, &codec_buf));
+ 		*cause = AST_CAUSE_FACILITY_NOT_IMPLEMENTED;
+@@ -931,8 +1633,12 @@
+ 	/* Find requested device and make sure it's connected. */
+ 	AST_RWLIST_RDLOCK(&devices);
+ 	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
+-		if (group > -1 && pvt->group == group && pvt->connected && !pvt->owner) {
+-			if (!mbl_has_service(pvt)) {
++		if (group > -1 && pvt->group == group &&
++			mbl_lecall_available(pvt) && !pvt->owner &&
++			(pvt->call_control != MBL_CALL_CONTROL_LE_GTBS ||
++			 pvt->lecall_token == 0)) {
++			if (pvt->call_control == MBL_CALL_CONTROL_CLASSIC &&
++				!mbl_has_service(pvt)) {
+ 				continue;
+ 			}
+ 
+@@ -942,7 +1648,9 @@
+ 		}
+ 	}
+ 	AST_RWLIST_UNLOCK(&devices);
+-	if (!pvt || !pvt->connected || pvt->owner) {
++	if (!pvt || !mbl_lecall_available(pvt) || pvt->owner ||
++		(pvt->call_control == MBL_CALL_CONTROL_LE_GTBS &&
++		 pvt->lecall_token != 0)) {
+ 		ast_log(LOG_WARNING, "Request to call on device %s which is not connected / already in use.\n", dest_dev);
+ 		*cause = AST_CAUSE_REQUESTED_CHAN_UNAVAIL;
+ 		return NULL;
+@@ -955,7 +1663,24 @@
+ 	}
+ 
+ 	ast_mutex_lock(&pvt->lock);
+-	chn = mbl_new(AST_STATE_DOWN, pvt, NULL, assignedids, requestor);
++	if (!mbl_lecall_available(pvt) || pvt->owner ||
++		(pvt->call_control == MBL_CALL_CONTROL_LE_GTBS &&
++		 pvt->lecall_token != 0)) {
++		ast_mutex_unlock(&pvt->lock);
++		ast_log(LOG_WARNING,
++			"Request raced with device state change on %s; channel was not allocated.\n",
++			dest_dev);
++		*cause = AST_CAUSE_REQUESTED_CHAN_UNAVAIL;
++		return NULL;
++	}
++	{
++		struct ast_format *requested_format = ast_format_cap_get_format(cap, 0);
++		chn = mbl_new(AST_STATE_DOWN, pvt, NULL, assignedids, requestor,
++			requested_format);
++		ao2_cleanup(requested_format);
++		if (chn)
++			mbl_msbc_stats_begin_locked(pvt);
++	}
+ 	ast_mutex_unlock(&pvt->lock);
+ 	if (!chn) {
+ 		ast_log(LOG_WARNING, "Unable to allocate channel structure.\n");
+@@ -995,14 +1720,41 @@
+ 
+ 	ast_mutex_lock(&pvt->lock);
+ 	if (pvt->type == MBL_TYPE_PHONE) {
+-		if (hfp_send_atd(pvt->hfp, dest_num)) {
+-			ast_mutex_unlock(&pvt->lock);
+-			ast_log(LOG_ERROR, "error sending ATD command on %s\n", pvt->id);
+-			return -1;
++		if (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS) {
++			uint8_t uri[CM_LE_CALL_PAYLOAD_SIZE];
++			size_t number_length = strlen(dest_num);
++			int result;
++
++			if (number_length + 4 > sizeof(uri)) {
++				ast_mutex_unlock(&pvt->lock);
++				ast_log(LOG_ERROR, "[%s] LE outgoing number exceeds bound\n",
++					pvt->id);
++				return -1;
++			}
++			memcpy(uri, "tel:", 4);
++			memcpy(uri + 4, dest_num, number_length);
++			result = mbl_lecall_send_locked(pvt, CM_LE_CALL_ORIGINATE,
++				uri, number_length + 4);
++			if (result < 0) {
++				ast_mutex_unlock(&pvt->lock);
++				ast_log(LOG_ERROR,
++					"[%s] failed to submit bounded GTBS originate command: %s\n",
++					pvt->id, strerror(-result));
++				return -1;
++			}
++			pvt->hangupcause = 0;
++			pvt->needchup = 1;
++			pvt->outgoing = 1;
++		} else {
++			if (hfp_send_atd(pvt->hfp, dest_num)) {
++				ast_mutex_unlock(&pvt->lock);
++				ast_log(LOG_ERROR, "error sending ATD command on %s\n", pvt->id);
++				return -1;
++			}
++			pvt->hangupcause = 0;
++			pvt->needchup = 1;
++			msg_queue_push(pvt, AT_OK, AT_D);
+ 		}
+-		pvt->hangupcause = 0;
+-		pvt->needchup = 1;
+-		msg_queue_push(pvt, AT_OK, AT_D);
+ 	} else {
+ 		if (hsp_send_ring(pvt->rfcomm_socket)) {
+ 			ast_log(LOG_ERROR, "[%s] error ringing device\n", pvt->id);
+@@ -1039,18 +1791,56 @@
+ 	ast_debug(1, "[%s] hanging up device\n", pvt->id);
+ 
+ 	ast_mutex_lock(&pvt->lock);
++	mbl_msbc_stats_report_locked(pvt, MBL_MSBC_STATS_HANGUP);
+ 	ast_channel_set_fd(ast, 0, -1);
+-	close(pvt->sco_socket);
+-	pvt->sco_socket = -1;
+ 
+-	if (pvt->needchup) {
++	if (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS) {
++		if (pvt->needchup && pvt->lecall_token != 0 &&
++			!pvt->lecall_remote_ended &&
++			(pvt->outgoing || pvt->answered ||
++			 pvt->lecall_local_answer_requested)) {
++			int result = mbl_lecall_send_locked(pvt,
++				CM_LE_CALL_TERMINATE, NULL, 0);
++
++			if (result < 0)
++				ast_log(LOG_WARNING,
++					"[%s] GTBS terminate submission failed without synthesizing rejection: %s\n",
++					pvt->id, strerror(-result));
++		}
++		if (pvt->lecall_token != 0)
++			pvt->lecall_suppressed_token = pvt->lecall_token;
++		pvt->needchup = 0;
++	} else if (pvt->needchup) {
+ 		hfp_send_chup(pvt->hfp);
+ 		msg_queue_push(pvt, AT_OK, AT_CHUP);
+ 		pvt->needchup = 0;
+ 	}
+ 
++	/* A normal channel hangup is distinct from a crashed or stalled media
++	 * peer. Send the generation-scoped marker before closing the lifecycle
++	 * descriptor so Go can drain POLLIN|POLLHUP and let Android finish ASCS
++	 * teardown. A send failure remains fail-safe: the following close is an
++	 * unmarked HUP and Go releases immediately. */
++	if (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS &&
++		pvt->leaudio.active) {
++		int result = cm_leaudio_normal_end(&pvt->leaudio);
++
++		if (result < 0)
++			ast_log(LOG_WARNING,
++				"[%s] LE Audio normal-end marker failed; peer HUP will remain immediate: %s\n",
++				pvt->id, strerror(-result));
++	}
++	mbl_leaudio_stats_report_locked(pvt, "channel-hangup");
++	mbl_leaudio_end_locked(pvt);
++	pvt->call_audio_transport = MBL_CALL_AUDIO_CLASSIC;
++	close(pvt->sco_socket);
++	pvt->sco_socket = -1;
++
+ 	pvt->outgoing = 0;
+ 	pvt->incoming = 0;
++	pvt->answered = 0;
++	pvt->lecall_local_answer_requested = 0;
++	pvt->lecall_remote_ended = 0;
+ 	pvt->needring = 0;
+ 	pvt->owner = NULL;
+ 	ast_channel_tech_pvt_set(ast, NULL);
+@@ -1075,9 +1865,24 @@
+ 
+ 	ast_mutex_lock(&pvt->lock);
+ 	if (pvt->incoming) {
+-		hfp_send_ata(pvt->hfp);
+-		msg_queue_push(pvt, AT_OK, AT_A);
+-		pvt->answered = 1;
++		if (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS) {
++			int result = mbl_lecall_send_locked(pvt,
++				CM_LE_CALL_ACCEPT, NULL, 0);
++
++			if (result < 0) {
++				ast_mutex_unlock(&pvt->lock);
++				ast_log(LOG_WARNING,
++					"[%s] GTBS accept submission failed: %s\n",
++					pvt->id, strerror(-result));
++				return -1;
++			}
++			pvt->lecall_local_answer_requested = 1;
++			pvt->needchup = 1;
++		} else {
++			hfp_send_ata(pvt->hfp);
++			msg_queue_push(pvt, AT_OK, AT_A);
++			pvt->answered = 1;
++		}
+ 	}
+ 	ast_mutex_unlock(&pvt->lock);
+ 
+@@ -1093,6 +1898,13 @@
+ 		return 0;
+ 
+ 	ast_mutex_lock(&pvt->lock);
++	if (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS) {
++		ast_mutex_unlock(&pvt->lock);
++		ast_log(LOG_WARNING,
++			"[%s] GTBS/CCP has no DTMF opcode; digit was not sent\n",
++			pvt->id);
++		return -1;
++	}
+ 	if (hfp_send_dtmf(pvt->hfp, digit)) {
+ 		ast_mutex_unlock(&pvt->lock);
+ 		ast_debug(1, "[%s] error sending digit %c\n", pvt->id, digit);
+@@ -1106,26 +1918,171 @@
+ 	return 0;
+ }
+ 
++static int mbl_cvsd_decode(struct mbl_pvt *pvt, const uint8_t *input,
++	size_t input_length, int16_t *output, size_t output_capacity)
++{
++	size_t input_offset = 0;
++	size_t output_samples = 0;
++
++	while (input_offset < input_length) {
++		uint8_t bytes[2];
++		int16_t sample;
++
++		if (pvt->cvsd_carry_valid) {
++			bytes[0] = pvt->cvsd_carry;
++			bytes[1] = input[input_offset++];
++			pvt->cvsd_carry_valid = 0;
++		} else if (input_offset + 1 < input_length) {
++			bytes[0] = input[input_offset++];
++			bytes[1] = input[input_offset++];
++		} else {
++			pvt->cvsd_carry = input[input_offset];
++			pvt->cvsd_carry_valid = 1;
++			break;
++		}
++
++		memcpy(&sample, bytes, sizeof(sample));
++		if (pvt->wideband_capable) {
++			if (output_samples + 2 > output_capacity)
++				return -ENOSPC;
++			output[output_samples++] = sample;
++			output[output_samples++] = sample;
++		} else {
++			if (output_samples + 1 > output_capacity)
++				return -ENOSPC;
++			output[output_samples++] = sample;
++		}
++	}
++
++	return (int) output_samples;
++}
++
++static int mbl_msbc_write_frame(struct mbl_pvt *pvt, const int16_t *pcm)
++{
++	uint8_t encoded[CM_MSBC_FRAME_BYTES];
++	uint8_t packets[CM_MSBC_MAX_SCO_MTU];
++	unsigned int mtu = pvt->sco_mtu;
++	size_t packets_length;
++	size_t offset;
++	int result;
++
++	if (pvt->msbc_stats.active)
++		mbl_stats_inc(&pvt->msbc_stats.tx_pcm_frames);
++	result = cm_msbc_encode(&pvt->msbc, pcm, encoded);
++	if (result < 0) {
++		if (pvt->msbc_stats.active)
++			mbl_stats_inc(&pvt->msbc_stats.tx_encode_failures);
++		ast_log(LOG_WARNING, "[%s] mSBC encode failed: %d\n", pvt->id, result);
++		return MBL_AUDIO_WRITE_FATAL;
++	}
++	if (pvt->msbc_stats.active)
++		mbl_stats_inc(&pvt->msbc_stats.tx_encoded_frames);
++	if (mtu == 0 || mtu > CM_MSBC_MAX_SCO_MTU)
++		mtu = 24;
++	result = cm_msbc_tx_packetize(&pvt->msbc_tx, encoded, mtu, packets,
++		&packets_length);
++	if (result < 0) {
++		if (pvt->msbc_stats.active) {
++			if (result == -ENOBUFS)
++				mbl_stats_inc(
++					&pvt->msbc_stats.tx_packetizer_enobufs);
++			else
++				mbl_stats_inc(
++					&pvt->msbc_stats.tx_packetizer_invalid);
++		}
++		ast_log(LOG_WARNING, "[%s] mSBC packetizer failed: %d\n",
++			pvt->id, result);
++		cm_msbc_tx_packetizer_reset(&pvt->msbc_tx);
++		return MBL_AUDIO_WRITE_FATAL;
++	}
++
++	for (offset = 0; offset < packets_length; offset += mtu) {
++		if (!sco_write(pvt->sco_socket, (char *) packets + offset, mtu)) {
++			if (pvt->msbc_stats.active)
++				mbl_stats_inc(&pvt->msbc_stats.sco_write_failures);
++			return offset == 0 ?
++				MBL_AUDIO_WRITE_SCO_FAILURE :
++				MBL_AUDIO_WRITE_FATAL;
++		}
++		if (pvt->msbc_stats.active) {
++			mbl_stats_inc(&pvt->msbc_stats.sco_tx_packets);
++			mbl_stats_add(&pvt->msbc_stats.sco_tx_bytes, mtu);
++		}
++	}
++	return MBL_AUDIO_WRITE_OK;
++}
++
+ static struct ast_frame *mbl_read(struct ast_channel *ast)
+ {
+ 
+ 	struct mbl_pvt *pvt = ast_channel_tech_pvt(ast);
+ 	struct ast_frame *fr = &ast_null_frame;
+-	int r;
++	uint8_t raw[SCO_RAW_BUFFER_SIZE];
++	size_t raw_length = 0;
++	ssize_t r = 0;
++	int samples;
++	int concealed = 0;
+ 
+ 	ast_debug(3, "*** mbl_read()\n");
++	if (!pvt)
++		return fr;
+ 
+ 	while (ast_mutex_trylock(&pvt->lock)) {
+ 		CHANNEL_DEADLOCK_AVOIDANCE(ast);
+ 	}
+ 
+-	if (!pvt->owner || pvt->sco_socket == -1) {
++	if (pvt->owner != ast) {
+ 		goto e_return;
+ 	}
++	if (pvt->call_audio_transport == MBL_CALL_AUDIO_LE) {
++		struct ast_format *le_format = mbl_leaudio_format(
++			(unsigned int) cm_leaudio_sample_rate(&pvt->leaudio));
++		const struct cm_leaudio_io_stats *stats;
++
++		if (!le_format || cm_leaudio_read_fd(&pvt->leaudio) < 0) {
++			mbl_leaudio_rx_fail_locked(pvt, "rx-state", -EINVAL, 0, -1);
++			goto e_return;
++		}
++		memset(&pvt->fr, 0x00, sizeof(struct ast_frame));
++		pvt->fr.frametype = AST_FRAME_VOICE;
++		pvt->fr.subclass.format = le_format;
++		pvt->fr.src = "Mobile/LEAudio";
++		pvt->fr.offset = AST_FRIENDLY_OFFSET;
++		pvt->fr.mallocd = 0;
++		pvt->fr.data.ptr = pvt->io_buf + AST_FRIENDLY_OFFSET;
++		if (!pvt->leaudio_session_valid ||
++			pvt->leaudio_session_owner != ast)
++			goto e_return;
++		samples = cm_leaudio_read_session(&pvt->leaudio,
++			&pvt->leaudio_session, pvt->fr.data.ptr,
++			AUDIO_IO_BUFFER_SIZE / sizeof(int16_t), &concealed);
++		if (samples < 0) {
++			if (samples == -ESTALE)
++				goto e_return;
++			stats = cm_leaudio_get_io_stats(&pvt->leaudio);
++			mbl_leaudio_rx_fail_locked(pvt,
++				stats ? cm_leaudio_io_stage_name(
++					stats->last_rx_error_stage) : "rx-unknown",
++				samples, stats ? stats->last_rx_error_detail : 0,
++				stats ? stats->last_rx_sdu_length : -1);
++			goto e_return;
++		}
++		if (samples == 0)
++			goto e_return;
++		pvt->fr.samples = samples;
++		pvt->fr.datalen = samples * sizeof(int16_t);
++		if (concealed)
++			ast_debug(2, "[%s] concealed one invalid LE Audio SDU\n", pvt->id);
++		fr = &pvt->fr;
++		goto process_frame;
++	}
++	if (pvt->sco_socket == -1)
++		goto e_return;
+ 
+ 	memset(&pvt->fr, 0x00, sizeof(struct ast_frame));
+ 	pvt->fr.frametype = AST_FRAME_VOICE;
+-	pvt->fr.subclass.format = DEVICE_FRAME_FORMAT;
++	pvt->fr.subclass.format = pvt->wideband_capable ?
++		ast_format_slin16 : ast_format_slin;
+ 	pvt->fr.src = "Mobile";
+ 	pvt->fr.offset = AST_FRIENDLY_OFFSET;
+ 	pvt->fr.mallocd = 0;
+@@ -1134,25 +2091,81 @@
+ 	pvt->fr.data.ptr = pvt->io_buf + AST_FRIENDLY_OFFSET;
+ 
+ 	do {
+-		if ((r = read(pvt->sco_socket, pvt->fr.data.ptr, DEVICE_FRAME_SIZE)) == -1) {
++		if (pvt->deferred_length != 0) {
++			raw_length = pvt->deferred_length;
++			memcpy(raw, pvt->deferred_data, raw_length);
++			pvt->deferred_length = 0;
++		}
++
++		if (raw_length < sizeof(raw)) {
++			size_t read_size = pvt->audio_codec == MBL_AUDIO_MSBC ?
++				pvt->sco_mtu : CVSD_DEVICE_FRAME_SIZE;
++			if (read_size == 0 || read_size > sizeof(raw) - raw_length)
++				read_size = sizeof(raw) - raw_length;
++			r = read(pvt->sco_socket, raw + raw_length, read_size);
++		}
++		if (r == -1) {
+ 			if (errno != EAGAIN && errno != EINTR) {
++				if (pvt->msbc_stats.active)
++					mbl_stats_inc(
++						&pvt->msbc_stats.sco_read_failures);
+ 				ast_debug(1, "[%s] read error %d, going to wait for new connection\n", pvt->id, errno);
+ 				close(pvt->sco_socket);
+ 				pvt->sco_socket = -1;
+ 				ast_channel_set_fd(ast, 0, -1);
+ 			}
+-			goto e_return;
++			if (raw_length == 0)
++				goto e_return;
++		} else if (r > 0) {
++			raw_length += (size_t) r;
+ 		}
+ 
+-		pvt->fr.datalen = r;
+-		pvt->fr.samples = r / 2;
++		if (pvt->audio_codec == MBL_AUDIO_MSBC) {
++			if (pvt->msbc_stats.active)
++				mbl_stats_add(&pvt->msbc_stats.sco_rx_bytes,
++					raw_length);
++			samples = cm_msbc_decode_feed(&pvt->msbc, raw, raw_length,
++				pvt->fr.data.ptr, AUDIO_IO_BUFFER_SIZE / sizeof(int16_t));
++			if (samples < 0) {
++				ast_log(LOG_WARNING, "[%s] mSBC decode failed: %d\n",
++					pvt->id, samples);
++				goto e_return;
++			}
++		} else {
++			if (pvt->do_alignment_detection && !pvt->wideband_capable &&
++				!pvt->cvsd_carry_valid)
++				do_alignment_detection(pvt, (char *) raw, raw_length);
++			samples = mbl_cvsd_decode(pvt, raw, raw_length,
++				pvt->fr.data.ptr, AUDIO_IO_BUFFER_SIZE / sizeof(int16_t));
++			if (samples < 0) {
++				ast_log(LOG_WARNING, "[%s] CVSD receive buffer failed: %d\n",
++					pvt->id, samples);
++				goto e_return;
++			}
++		}
++		if (samples == 0)
++			goto e_return;
+ 
+-		if (pvt->do_alignment_detection)
+-			do_alignment_detection(pvt, pvt->fr.data.ptr, r);
++		pvt->fr.samples = samples;
++		pvt->fr.datalen = samples * sizeof(int16_t);
+ 
+-		ast_smoother_feed(pvt->bt_in_smoother, &pvt->fr);
+-		fr = ast_smoother_read(pvt->bt_in_smoother);
++		if (pvt->audio_codec == MBL_AUDIO_MSBC) {
++			/* A single SCO read can decode more than one 120-sample mSBC
++			 * frame, including frames reconstructed by packet-loss
++			 * concealment. Deliver the complete decoded timeline at once;
++			 * a fixed-size smoother would consume only one slice per socket
++			 * callback and eventually discard queued PCM. */
++			fr = &pvt->fr;
++		} else {
++			if (ast_smoother_feed(pvt->bt_in_smoother, &pvt->fr) < 0) {
++				ast_log(LOG_WARNING, "[%s] CVSD input smoother feed failed\n",
++					pvt->id);
++				goto e_return;
++			}
++			fr = ast_smoother_read(pvt->bt_in_smoother);
++		}
+ 	} while (fr == NULL);
++process_frame:
+ 	fr = ast_dsp_process(ast, pvt->dsp, fr);
+ 
+ 	ast_mutex_unlock(&pvt->lock);
+@@ -1169,8 +2182,11 @@
+ 
+ 	struct mbl_pvt *pvt = ast_channel_tech_pvt(ast);
+ 	struct ast_frame *f;
++	int result;
+ 
+ 	ast_debug(3, "*** mbl_write\n");
++	if (!pvt)
++		return 0;
+ 
+ 	if (frame->frametype != AST_FRAME_VOICE) {
+ 		return 0;
+@@ -1179,11 +2195,112 @@
+ 	while (ast_mutex_trylock(&pvt->lock)) {
+ 		CHANNEL_DEADLOCK_AVOIDANCE(ast);
+ 	}
++	if (pvt->owner != ast) {
++		ast_mutex_unlock(&pvt->lock);
++		return 0;
++	}
++	if (pvt->call_audio_transport == MBL_CALL_AUDIO_LE_FAILED) {
++		ast_mutex_unlock(&pvt->lock);
++		return 0;
++	}
++	if (pvt->call_audio_transport == MBL_CALL_AUDIO_LE) {
++		const struct cm_leaudio_io_stats *stats;
++
++		if (!pvt->leaudio_session_valid ||
++			pvt->leaudio_session_owner != ast ||
++			!cm_leaudio_tx_active(&pvt->leaudio)) {
++			ast_mutex_unlock(&pvt->lock);
++			return 0;
++		}
++		if (ast_smoother_feed(pvt->bt_out_smoother, frame) < 0) {
++			mbl_leaudio_tx_fail_locked(pvt, "tx-smoother", -ENOBUFS, 0);
++			ast_mutex_unlock(&pvt->lock);
++			return 0;
++		}
++		while ((f = ast_smoother_read(pvt->bt_out_smoother))) {
++			result = cm_leaudio_write_session(&pvt->leaudio,
++				&pvt->leaudio_session, f->data.ptr,
++				(size_t) f->samples);
++			if (result < 0) {
++				if (result == -ESTALE)
++					break;
++				if (result == -EAGAIN || result == -EWOULDBLOCK ||
++					result == -EINTR)
++					continue;
++				stats = cm_leaudio_get_io_stats(&pvt->leaudio);
++				mbl_leaudio_tx_fail_locked(pvt,
++					stats ? cm_leaudio_io_stage_name(
++						stats->last_tx_error_stage) : "tx-unknown",
++					result, stats ? stats->last_tx_error_detail : 0);
++				break;
++			}
++		}
++		/* Media failure is intentionally absorbed here.  Returning a
++		 * technology write error can cause the bridge to tear down the call. */
++		ast_mutex_unlock(&pvt->lock);
++		return 0;
++	}
++	/* Audio frames can arrive before the phone has opened SCO/eSCO. Preserve
++	 * chan_mobile's original behavior and drop only those pre-link frames. */
++	if (pvt->sco_socket == -1) {
++		ast_mutex_unlock(&pvt->lock);
++		return 0;
++	}
+ 
+-	ast_smoother_feed(pvt->bt_out_smoother, frame);
++	if (ast_smoother_feed(pvt->bt_out_smoother, frame) < 0) {
++		if (pvt->msbc_stats.active)
++			mbl_stats_inc(&pvt->msbc_stats.tx_smoother_failures);
++		ast_log(LOG_WARNING, "[%s] Bluetooth output smoother feed failed\n",
++			pvt->id);
++		ast_mutex_unlock(&pvt->lock);
++		return -1;
++	}
+ 
+ 	while ((f = ast_smoother_read(pvt->bt_out_smoother))) {
+-		sco_write(pvt->sco_socket, f->data.ptr, f->datalen);
++		if (pvt->audio_codec == MBL_AUDIO_MSBC) {
++			result = mbl_msbc_write_frame(pvt, f->data.ptr);
++		} else if (pvt->wideband_capable) {
++			const int16_t *wideband = f->data.ptr;
++			int16_t narrowband[CVSD_DEVICE_FRAME_SIZE / sizeof(int16_t)];
++			size_t i;
++
++			for (i = 0; i < ARRAY_LEN(narrowband); ++i) {
++				int32_t mixed = (int32_t) wideband[i * 2] +
++					wideband[i * 2 + 1];
++				narrowband[i] = (int16_t) (mixed / 2);
++			}
++			result = sco_write(pvt->sco_socket, (char *) narrowband,
++				sizeof(narrowband)) ?
++				MBL_AUDIO_WRITE_OK :
++				MBL_AUDIO_WRITE_SCO_FAILURE;
++		} else {
++			result = sco_write(pvt->sco_socket, f->data.ptr, f->datalen) ?
++				MBL_AUDIO_WRITE_OK :
++				MBL_AUDIO_WRITE_SCO_FAILURE;
++		}
++
++		/* Dial can forward caller media before the phone's new SCO/eSCO
++		 * link is writable. Drop only transport failures before the HFP
++		 * answer; codec, packetizer, partial-write, and answered-call
++		 * failures remain fatal. Continue draining the smoother so stale
++		 * pre-answer audio cannot spill into the answered call. */
++		if (result == MBL_AUDIO_WRITE_SCO_FAILURE &&
++			ast_channel_state(ast) != AST_STATE_UP &&
++			!pvt->answered) {
++			if (pvt->msbc_stats.active)
++				mbl_stats_inc(&pvt->msbc_stats.preanswer_sco_drops);
++			if (!pvt->preanswer_sco_drop_logged) {
++				ast_log(LOG_NOTICE, "[%s] ignored pre-answer SCO transmit "
++					"failure; waiting for the established audio link\n",
++					pvt->id);
++				pvt->preanswer_sco_drop_logged = 1;
++			}
++			continue;
++		}
++		if (result != MBL_AUDIO_WRITE_OK) {
++			ast_mutex_unlock(&pvt->lock);
++			return -1;
++		}
+ 	}
+ 
+ 	ast_mutex_unlock(&pvt->lock);
+@@ -1203,8 +2320,11 @@
+ 	}
+ 
+ 	ast_mutex_lock(&pvt->lock);
+-	if (pvt->owner == oldchan)
++	if (pvt->owner == oldchan) {
+ 		pvt->owner = newchan;
++		if (pvt->leaudio_session_owner == oldchan)
++			pvt->leaudio_session_owner = newchan;
++	}
+ 	ast_mutex_unlock(&pvt->lock);
+ 
+ 	return 0;
+@@ -1233,13 +2353,14 @@
+ 		return res;
+ 
+ 	ast_mutex_lock(&pvt->lock);
+-	if (pvt->connected) {
++	if (mbl_lecall_available(pvt)) {
+ 		if (pvt->owner)
+ 			res = AST_DEVICE_INUSE;
+ 		else
+ 			res = AST_DEVICE_NOT_INUSE;
+ 
+-		if (!mbl_has_service(pvt))
++		if (pvt->call_control == MBL_CALL_CONTROL_CLASSIC &&
++			!mbl_has_service(pvt))
+ 			res = AST_DEVICE_UNAVAILABLE;
+ 	}
+ 	ast_mutex_unlock(&pvt->lock);
+@@ -1871,7 +2992,7 @@
+ static int sco_write(int s, char *buf, int len)
+ {
+ 
+-	int r;
++	ssize_t r;
+ 
+ 	if (s == -1) {
+ 		ast_debug(3, "sco_write() not ready\n");
+@@ -1880,9 +3001,15 @@
+ 
+ 	ast_debug(3, "sco_write()\n");
+ 
+-	r = write(s, buf, len);
+-	if (r == -1) {
+-		ast_debug(3, "sco write error %d\n", errno);
++	do {
++		r = write(s, buf, len);
++	} while (r == -1 && errno == EINTR);
++	if (r != len) {
++		if (r == -1)
++			ast_debug(3, "sco write error %d\n", errno);
++		else
++			ast_log(LOG_WARNING, "short SCO write: %zd of %d bytes\n", r,
++				len);
+ 		return 0;
+ 	}
+ 
+@@ -1901,9 +3028,7 @@
+ 	struct sockaddr_sco addr;
+ 	socklen_t addrlen;
+ 	struct mbl_pvt *pvt;
+-	socklen_t len;
+ 	char saddr[18];
+-	struct sco_options so;
+ 	int sock;
+ 
+ 	addrlen = sizeof(struct sockaddr_sco);
+@@ -1912,11 +3037,8 @@
+ 		return 0;
+ 	}
+ 
+-	len = sizeof(so);
+-	getsockopt(sock, SOL_SCO, SCO_OPTIONS, &so, &len);
+-
+ 	ba2str(&addr.sco_bdaddr, saddr);
+-	ast_debug(1, "Incoming Audio Connection from device %s MTU is %d\n", saddr, so.mtu);
++	ast_debug(1, "Incoming Audio Connection from device %s\n", saddr);
+ 
+ 	/* figure out which device this sco connection belongs to */
+ 	pvt = NULL;
+@@ -1933,6 +3055,70 @@
+ 	}
+ 
+ 	ast_mutex_lock(&pvt->lock);
++	if (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS) {
++		ast_log(LOG_NOTICE,
++			"[%s] discarded SCO while default-off GTBS/LE mode owns media\n",
++			pvt->id);
++		close(sock);
++		ast_mutex_unlock(&pvt->lock);
++		return 1;
++	}
++	if (adapter->deferred_setup) {
++		if (pvt->audio_codec == MBL_AUDIO_MSBC) {
++			struct bt_voice voice = { .setting = BT_VOICE_TRANSPARENT };
++			if (setsockopt(sock, SOL_BLUETOOTH, BT_VOICE, &voice,
++				sizeof(voice)) == -1) {
++				ast_log(LOG_ERROR, "[%s] unable to select transparent eSCO: %s\n",
++					pvt->id, strerror(errno));
++				close(sock);
++				ast_mutex_unlock(&pvt->lock);
++				return 1;
++			}
++		}
++
++		/* BT_DEFER_SETUP requires a read to authorize the incoming link.
++		 * Preserve the returned bytes so the first audio packet is not lost. */
++		{
++			ssize_t authorized = read(sock, pvt->deferred_data,
++				sizeof(pvt->deferred_data));
++			if (authorized < 0) {
++				ast_log(LOG_ERROR, "[%s] unable to authorize deferred SCO: %s\n",
++					pvt->id, strerror(errno));
++				close(sock);
++				ast_mutex_unlock(&pvt->lock);
++				return 1;
++			}
++			pvt->deferred_length = (size_t) authorized;
++		}
++	}
++
++	pvt->sco_mtu = sco_effective_mtu(pvt, sock);
++	if (pvt->audio_codec == MBL_AUDIO_MSBC && cm_msbc_reset(&pvt->msbc) < 0) {
++		ast_log(LOG_ERROR, "[%s] unable to reset mSBC for new eSCO link\n",
++			pvt->id);
++		close(sock);
++		ast_mutex_unlock(&pvt->lock);
++		return 1;
++	}
++	if (pvt->msbc_stats.active &&
++		pvt->audio_codec == MBL_AUDIO_MSBC) {
++		pvt->msbc_stats.used_msbc = 1;
++		cm_msbc_set_rx_stats(&pvt->msbc, &pvt->msbc_stats.rx);
++		mbl_stats_inc(&pvt->msbc_stats.sco_links);
++	}
++	cm_msbc_tx_packetizer_reset(&pvt->msbc_tx);
++	pvt->cvsd_carry_valid = 0;
++	ast_log(LOG_NOTICE, "[%s] audio link codec=%s effective-mtu=%u%s\n", pvt->id,
++		pvt->audio_codec == MBL_AUDIO_MSBC ? "mSBC" : "CVSD",
++		pvt->sco_mtu,
++		(adapter->usb_transport && adapter->mediatek &&
++		 pvt->audio_codec == MBL_AUDIO_MSBC &&
++		 pvt->sco_mtu == CM_MSBC_FRAME_BYTES) ?
++			" (MediaTek alt6 60-byte fix)" :
++		((adapter->usb_transport && adapter->realtek &&
++		  pvt->audio_codec == MBL_AUDIO_MSBC) ?
++			" (Realtek USB fix)" : ""));
++
+ 	if (pvt->sco_socket != -1) {
+ 		close(pvt->sco_socket);
+ 		pvt->sco_socket = -1;
+@@ -1940,7 +3126,12 @@
+ 
+ 	pvt->sco_socket = sock;
+ 	if (pvt->owner) {
+-		ast_channel_set_fd(pvt->owner, 0, sock);
++		/* A canary call selects its media transport once in mbl_new().
++		 * Keep HFP/SCO control compatibility, but never replace an active
++		 * ISO read descriptor underneath that call. */
++		if (pvt->call_control != MBL_CALL_CONTROL_LE_GTBS &&
++			pvt->call_audio_transport != MBL_CALL_AUDIO_LE)
++			ast_channel_set_fd(pvt->owner, 0, sock);
+ 	} else {
+ 		ast_debug(1, "incoming audio connection for pvt without owner\n");
+ 	}
+@@ -1964,7 +3155,6 @@
+ 		ast_log(LOG_ERROR, "Unable to create sco listener socket for adapter %s.\n", adapter->id);
+ 		goto e_return;
+ 	}
+-
+ 	memset(&addr, 0, sizeof(addr));
+ 	addr.sco_family = AF_BLUETOOTH;
+ 	bacpy(&addr.sco_bdaddr, &adapter->addr);
+@@ -1972,6 +3162,14 @@
+ 		ast_log(LOG_ERROR, "Unable to bind sco listener socket. (%d)\n", errno);
+ 		goto e_close_socket;
+ 	}
++	/* Linux accepts BT_DEFER_SETUP on a bound SCO socket. Setting it before
++	 * bind returns EINVAL; BlueALSA uses this bind -> defer -> listen order. */
++	if (adapter->deferred_setup && sco_enable_deferred_setup(adapter) < 0) {
++		ast_log(LOG_WARNING, "Adapter %s cannot enable BT_DEFER_SETUP; "
++			"Wideband Speech will remain disabled: %s\n",
++			adapter->id, strerror(errno));
++		adapter->deferred_setup = 0;
++	}
+ 	if (setsockopt(adapter->sco_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
+ 		ast_log(LOG_ERROR, "Unable to setsockopt sco listener socket.\n");
+ 		goto e_close_socket;
+@@ -1990,6 +3188,80 @@
+ 	return -1;
+ }
+ 
++static int sco_enable_deferred_setup(struct adapter_pvt *adapter)
++{
++#ifdef BT_DEFER_SETUP
++	uint32_t defer = 1;
++	return setsockopt(adapter->sco_socket, SOL_BLUETOOTH, BT_DEFER_SETUP,
++		&defer, sizeof(defer));
++#else
++	errno = ENOTSUP;
++	return -1;
++#endif
++}
++
++static unsigned int sco_effective_mtu(struct mbl_pvt *pvt, int sock)
++{
++	struct sco_options options = { 0 };
++	socklen_t length = sizeof(options);
++	unsigned int mtu = 0;
++	unsigned int kernel_mtu = 0;
++	int options_read = 0;
++	int options_errno = 0;
++
++	if (getsockopt(sock, SOL_SCO, SCO_OPTIONS, &options, &length) == 0) {
++		mtu = options.mtu;
++		kernel_mtu = mtu;
++		options_read = 1;
++	} else {
++		options_errno = errno;
++	}
++	if (pvt->adapter->usb_transport) {
++		if (pvt->audio_codec == MBL_AUDIO_MSBC) {
++			if (pvt->adapter->realtek)
++				mtu = 72;
++			else if (pvt->adapter->mediatek &&
++				((options_read && mtu >= CM_MSBC_FRAME_BYTES) ||
++				 (!options_read &&
++				  pvt->adapter->controller_sco_mtu >=
++					CM_MSBC_FRAME_BYTES)))
++				/*
++				 * Linux btusb altsetting 6 carries one complete
++				 * 60-byte H2/mSBC payload behind its 3-byte HCI SCO
++				 * header. If SCO_OPTIONS is unavailable on an
++				 * accepted deferred-setup socket, the controller
++				 * SCO MTU reported by HCI_DEV_INFO is the bounded
++				 * fallback. Splitting the frame into legacy 24-byte
++				 * writes makes btusb pace each fragment separately.
++				 */
++				mtu = CM_MSBC_FRAME_BYTES;
++			else
++				mtu = 24;
++		} else {
++			mtu = CVSD_DEVICE_FRAME_SIZE;
++		}
++	}
++	if (mtu == 0 || mtu > CM_MSBC_MAX_SCO_MTU)
++		mtu = pvt->audio_codec == MBL_AUDIO_MSBC ? 24 :
++			CVSD_DEVICE_FRAME_SIZE;
++	if (pvt->adapter->usb_transport &&
++		pvt->audio_codec == MBL_AUDIO_MSBC) {
++		if (options_read)
++			ast_log(LOG_NOTICE,
++				"[%s] SCO MTU kernel=%u selected=%u MediaTek=%s\n",
++				pvt->id, kernel_mtu, mtu,
++				pvt->adapter->mediatek ? "yes" : "no");
++		else
++			ast_log(LOG_NOTICE,
++				"[%s] SCO MTU kernel=unavailable selected=%u MediaTek=%s "
++				"controller=%u errno=%d\n",
++				pvt->id, mtu,
++				pvt->adapter->mediatek ? "yes" : "no",
++				pvt->adapter->controller_sco_mtu, options_errno);
++	}
++	return mtu;
++}
++
+ 
+ /*
+  * Hayes AT command helpers.
+@@ -2037,6 +3309,8 @@
+ 		return AT_CIEV;
+ 	} else if (at_match_prefix(buf, "+BRSF:")) {
+ 		return AT_BRSF;
++	} else if (at_match_prefix(buf, "+BCS:")) {
++		return AT_BCS;
+ 	} else if (at_match_prefix(buf, "+CIND:")) {
+ 		return AT_CIND;
+ 	} else if (at_match_prefix(buf, "+CLIP:")) {
+@@ -2093,6 +3367,8 @@
+ 		return "RING";
+ 	case AT_BRSF:
+ 		return "AT+BRSF";
++	case AT_BCS:
++		return "AT+BCS";
+ 	case AT_CIND:
+ 		return "AT+CIND";
+ 	case AT_CIEV:
+@@ -2136,6 +3412,8 @@
+ 		return "AT+CNMI";
+ 	case AT_CMER:
+ 		return "AT+CMER";
++	case AT_BAC:
++		return "AT+BAC";
+ 	case AT_CIND_TEST:
+ 		return "AT+CIND=?";
+ 	case AT_CUSD:
+@@ -2478,6 +3756,8 @@
+ 	brsf |= hf->volume ? HFP_HF_VOLUME : 0;
+ 	brsf |= hf->status ? HFP_HF_STATUS : 0;
+ 	brsf |= hf->control ? HFP_HF_CONTROL : 0;
++	brsf |= hf->codec ? HFP_HF_CODEC : 0;
++	brsf |= hf->esco ? HFP_HF_ESCO : 0;
+ 
+ 	return brsf;
+ }
+@@ -2500,6 +3780,8 @@
+ 	ag->status = brsf & HFP_AG_STATUS ? 1 : 0;
+ 	ag->control = brsf & HFP_AG_CONTROL ? 1 : 0;
+ 	ag->errors = brsf & HFP_AG_ERRORS ? 1 : 0;
++	ag->codec = brsf & HFP_AG_CODEC ? 1 : 0;
++	ag->esco = brsf & HFP_AG_ESCO ? 1 : 0;
+ 
+ 	return ag;
+ }
+@@ -2520,6 +3802,22 @@
+ 	return rfcomm_write(hfp->rsock, cmd);
+ }
+ 
++/*! \brief Advertise mandatory CVSD and, when enabled, mandatory WBS mSBC. */
++static int hfp_send_bac(struct hfp_pvt *hfp, int wideband)
++{
++	return rfcomm_write(hfp->rsock,
++		wideband ? "AT+BAC=1,2\r" : "AT+BAC=1\r");
++}
++
++/*! \brief Confirm the codec selected by the audio gateway. */
++static int hfp_send_bcs(struct hfp_pvt *hfp, int codec)
++{
++	char command[24];
++
++	snprintf(command, sizeof(command), "AT+BCS=%d\r", codec);
++	return rfcomm_write(hfp->rsock, command);
++}
++
+ /*!
+  * \brief Send the CIND read command.
+  * \param hfp an hfp_pvt struct
+@@ -2735,6 +4033,13 @@
+ 	return 0;
+ }
+ 
++static int hfp_parse_bcs(const char *buf, int *codec)
++{
++	if (codec == NULL || sscanf(buf, "+BCS:%d", codec) != 1)
++		return -1;
++	return 0;
++}
++
+ /*!
+  * \brief Parse and store the given indicator.
+  * \param hfp an hfp_pvt struct
+@@ -3120,30 +4425,58 @@
+ 
+ static sdp_session_t *sdp_register(void)
+ {
+-	uint32_t service_uuid_int[] = {0, 0, 0, GENERIC_AUDIO_SVCLASS_ID};
+ 	uint8_t rfcomm_channel = 1;
++	uint16_t supported_features;
+ 	const char *service_name = "Asterisk PABX";
+ 	const char *service_dsc = "Asterisk PABX";
+ 	const char *service_prov = "Asterisk";
++	struct mbl_pvt *device;
+ 
+ 	uuid_t root_uuid, l2cap_uuid, rfcomm_uuid, svc_uuid, svc_class1_uuid, svc_class2_uuid;
+-	sdp_list_t  *l2cap_list = 0, *rfcomm_list = 0, *root_list = 0, *proto_list = 0, *access_proto_list = 0, *svc_uuid_list = 0;
++	sdp_profile_desc_t profile;
++	sdp_list_t  *l2cap_list = 0, *rfcomm_list = 0, *root_list = 0, *proto_list = 0, *access_proto_list = 0, *svc_uuid_list = 0, *profile_list = 0;
+ 	sdp_data_t *channel = 0;
+ 
+ 	sdp_session_t *session = 0;
+ 
+ 	sdp_record_t *record = sdp_record_alloc();
+ 
+-	sdp_uuid128_create(&svc_uuid, &service_uuid_int);
++	/* Advertise the profile that the RFCOMM state machine actually
++	 * implements.  The legacy record claimed HSP Headset and omitted both
++	 * the HFP profile descriptor and SupportedFeatures, which lets an AG
++	 * classify the service as a pre-HFP-1.6 peer and select CVSD even after
++	 * a successful AT+BAC=1,2 exchange. */
++	sdp_uuid16_create(&svc_uuid, HANDSFREE_SVCLASS_ID);
+ 	sdp_set_service_id(record, svc_uuid);
+ 
+-	sdp_uuid32_create(&svc_class1_uuid, GENERIC_AUDIO_SVCLASS_ID);
+-	sdp_uuid32_create(&svc_class2_uuid, HEADSET_PROFILE_ID);
++	sdp_uuid16_create(&svc_class1_uuid, HANDSFREE_SVCLASS_ID);
++	sdp_uuid16_create(&svc_class2_uuid, GENERIC_AUDIO_SVCLASS_ID);
+ 
+ 	svc_uuid_list = sdp_list_append(0, &svc_class1_uuid);
+ 	svc_uuid_list = sdp_list_append(svc_uuid_list, &svc_class2_uuid);
+ 	sdp_set_service_classes(record, svc_uuid_list);
+ 
++	memset(&profile, 0, sizeof(profile));
++	sdp_uuid16_create(&profile.uuid, HANDSFREE_PROFILE_ID);
++	profile.version = 0x0107;
++	profile_list = sdp_list_append(0, &profile);
++	sdp_set_profile_descs(record, profile_list);
++
++	/* HFP SDP SupportedFeatures bits 0..4 mirror AT+BRSF. Bit 5 separately
++	 * advertises Wide Band Speech. Only set it when configuration loading
++	 * left at least one phone with a usable mSBC path. */
++	supported_features = hfp_brsf2int(&hfp_our_brsf) & 0x001f;
++	AST_RWLIST_RDLOCK(&devices);
++	AST_RWLIST_TRAVERSE(&devices, device, entry) {
++		if (device->type == MBL_TYPE_PHONE && device->wideband_requested) {
++			supported_features |= (1 << 5);
++			break;
++		}
++	}
++	AST_RWLIST_UNLOCK(&devices);
++	sdp_attr_add_new(record, SDP_ATTR_SUPPORTED_FEATURES, SDP_UINT16,
++		&supported_features);
++
+ 	sdp_uuid16_create(&root_uuid, PUBLIC_BROWSE_GROUP);
+ 	root_list = sdp_list_append(0, &root_uuid);
+ 	sdp_set_browse_groups( record, root_list );
+@@ -3177,6 +4510,7 @@
+ 	sdp_list_free(root_list, 0);
+ 	sdp_list_free(access_proto_list, 0);
+ 	sdp_list_free(svc_uuid_list, 0);
++	sdp_list_free(profile_list, 0);
+ 
+ 	return session;
+ 
+@@ -3203,6 +4537,9 @@
+ 			ast_debug(1, "[%s] error parsing BRSF\n", pvt->id);
+ 			goto e_return;
+ 		}
++		ast_log(LOG_NOTICE, "[%s] AG codec-negotiation=%s eSCO-S4=%s\n",
++			pvt->id, pvt->hfp->brsf.codec ? "yes" : "no",
++			pvt->hfp->brsf.esco ? "yes" : "no");
+ 
+ 		if (msg_queue_push(pvt, AT_OK, AT_BRSF)) {
+ 			ast_debug(1, "[%s] error handling BRSF\n", pvt->id);
+@@ -3223,6 +4560,85 @@
+ 	return -1;
+ }
+ 
++static int hfp_continue_slc_after_codec_setup(struct mbl_pvt *pvt)
++{
++	/* If this is a blackberry do CMER now, otherwise continue with CIND. */
++	if (pvt->blackberry) {
++		if (hfp_send_cmer(pvt->hfp, 1) ||
++			msg_queue_push(pvt, AT_OK, AT_CMER))
++			return -1;
++	} else {
++		if (hfp_send_cind_test(pvt->hfp) ||
++			msg_queue_push(pvt, AT_CIND, AT_CIND_TEST))
++			return -1;
++	}
++	return 0;
++}
++
++static int handle_response_bcs(struct mbl_pvt *pvt, char *buf)
++{
++	int codec;
++
++	if (hfp_parse_bcs(buf, &codec)) {
++		ast_log(LOG_WARNING, "[%s] malformed +BCS response: %s\n",
++			pvt->id, buf);
++		return -1;
++	}
++
++	if (codec == HFP_CODEC_MSBC && pvt->wideband_capable) {
++		if (cm_msbc_reset(&pvt->msbc) < 0) {
++			ast_log(LOG_WARNING, "[%s] mSBC reset failed; advertising CVSD only\n",
++				pvt->id);
++			pvt->audio_codec = MBL_AUDIO_CVSD;
++			if (pvt->msbc_stats.active)
++				cm_msbc_set_rx_stats(&pvt->msbc, NULL);
++			if (hfp_send_bac(pvt->hfp, 0) ||
++				msg_queue_push(pvt, AT_OK, AT_BAC))
++				return -1;
++			return 0;
++		}
++		pvt->audio_codec = MBL_AUDIO_MSBC;
++		if (pvt->msbc_stats.active) {
++			pvt->msbc_stats.used_msbc = 1;
++			cm_msbc_set_rx_stats(&pvt->msbc,
++				&pvt->msbc_stats.rx);
++		}
++		cm_msbc_tx_packetizer_reset(&pvt->msbc_tx);
++		pvt->cvsd_carry_valid = 0;
++		ast_smoother_reset(pvt->bt_out_smoother, CM_MSBC_PCM_BYTES);
++		ast_smoother_reset(pvt->bt_in_smoother, MSBC_CHANNEL_FRAME_SIZE);
++		ast_log(LOG_NOTICE, "[%s] HFP codec selected: mSBC 16 kHz\n", pvt->id);
++	} else if (codec == HFP_CODEC_CVSD) {
++		pvt->audio_codec = MBL_AUDIO_CVSD;
++		if (pvt->msbc_stats.active)
++			cm_msbc_set_rx_stats(&pvt->msbc, NULL);
++		cm_msbc_tx_packetizer_reset(&pvt->msbc_tx);
++		pvt->cvsd_carry_valid = 0;
++		ast_smoother_reset(pvt->bt_out_smoother,
++			pvt->wideband_capable ? CVSD_DEVICE_FRAME_SIZE * 2 :
++			CVSD_DEVICE_FRAME_SIZE);
++		ast_smoother_reset(pvt->bt_in_smoother,
++			pvt->wideband_capable ? MSBC_CHANNEL_FRAME_SIZE :
++			CVSD_CHANNEL_FRAME_SIZE);
++		ast_log(LOG_NOTICE, "[%s] HFP codec selected: CVSD fallback\n", pvt->id);
++	} else {
++		ast_log(LOG_WARNING, "[%s] AG selected unsupported HFP codec %d; "
++			"advertising CVSD only\n", pvt->id, codec);
++		pvt->audio_codec = MBL_AUDIO_CVSD;
++		if (pvt->msbc_stats.active)
++			cm_msbc_set_rx_stats(&pvt->msbc, NULL);
++		if (hfp_send_bac(pvt->hfp, 0) ||
++			msg_queue_push(pvt, AT_OK, AT_BAC))
++			return -1;
++		return 0;
++	}
++
++	if (hfp_send_bcs(pvt->hfp, codec) ||
++		msg_queue_push(pvt, AT_OK, AT_BCS))
++		return -1;
++	return 0;
++}
++
+ /*!
+  * \brief Handle the CIND response.
+  * \param pvt a mbl_pvt structure
+@@ -3281,21 +4697,34 @@
+ 		/* initialization stuff */
+ 		case AT_BRSF:
+ 			ast_debug(1, "[%s] BSRF sent successfully\n", pvt->id);
+-
+-			/* If this is a blackberry do CMER now, otherwise
+-			 * continue with CIND as normal. */
+-			if (pvt->blackberry) {
+-				if (hfp_send_cmer(pvt->hfp, 1) || msg_queue_push(pvt, AT_OK, AT_CMER)) {
+-					ast_debug(1, "[%s] error sending CMER\n", pvt->id);
++			if (pvt->wideband_requested && pvt->hfp->brsf.codec &&
++				pvt->hfp->brsf.esco) {
++				if (hfp_send_bac(pvt->hfp, 1) ||
++					msg_queue_push(pvt, AT_OK, AT_BAC)) {
++					ast_debug(1, "[%s] error sending BAC\n", pvt->id);
+ 					goto e_return;
+ 				}
+ 			} else {
+-				if (hfp_send_cind_test(pvt->hfp) || msg_queue_push(pvt, AT_CIND, AT_CIND_TEST)) {
+-					ast_debug(1, "[%s] error sending CIND test\n", pvt->id);
++				pvt->wideband_capable = 0;
++				if (hfp_continue_slc_after_codec_setup(pvt))
++					goto e_return;
++			}
++			break;
++		case AT_BAC:
++			if (!pvt->hfp->initialized) {
++				pvt->wideband_capable = pvt->wideband_requested &&
++					pvt->hfp->brsf.codec && pvt->hfp->brsf.esco;
++				ast_log(LOG_NOTICE, "[%s] HFP Wideband Speech %s; "
++					"available codecs: CVSD%s\n", pvt->id,
++					pvt->wideband_capable ? "enabled" : "disabled",
++					pvt->wideband_capable ? ", mSBC" : "");
++				if (hfp_continue_slc_after_codec_setup(pvt))
+ 					goto e_return;
+-				}
+ 			}
+ 			break;
++		case AT_BCS:
++			ast_debug(1, "[%s] codec selection acknowledged\n", pvt->id);
++			break;
+ 		case AT_CIND_TEST:
+ 			ast_debug(1, "[%s] CIND test sent successfully\n", pvt->id);
+ 
+@@ -3456,6 +4885,28 @@
+ 		case AT_BRSF:
+ 			ast_debug(1, "[%s] error reading BSRF\n", pvt->id);
+ 			goto e_return;
++		case AT_BAC:
++			ast_log(LOG_WARNING, "[%s] AG rejected BAC; using CVSD fallback\n",
++				pvt->id);
++			pvt->audio_codec = MBL_AUDIO_CVSD;
++			if (pvt->msbc_stats.active)
++				cm_msbc_set_rx_stats(&pvt->msbc, NULL);
++			if (!pvt->hfp->initialized) {
++				pvt->wideband_capable = 0;
++				if (hfp_continue_slc_after_codec_setup(pvt))
++					goto e_return;
++			}
++			break;
++		case AT_BCS:
++			ast_log(LOG_WARNING, "[%s] AG rejected BCS; requesting CVSD fallback\n",
++				pvt->id);
++			pvt->audio_codec = MBL_AUDIO_CVSD;
++			if (pvt->msbc_stats.active)
++				cm_msbc_set_rx_stats(&pvt->msbc, NULL);
++			if (hfp_send_bac(pvt->hfp, 0) ||
++				msg_queue_push(pvt, AT_OK, AT_BAC))
++				goto e_return;
++			break;
+ 		case AT_CIND_TEST:
+ 			ast_debug(1, "[%s] error during CIND test\n", pvt->id);
+ 			goto e_return;
+@@ -3581,6 +5032,7 @@
+ 		case HFP_CIND_CALL_ACTIVE:
+ 			if (pvt->outgoing) {
+ 				ast_debug(1, "[%s] remote end answered\n", pvt->id);
++				pvt->answered = 1;
+ 				mbl_queue_control(pvt, AST_CONTROL_ANSWER);
+ 			} else if (pvt->incoming && pvt->answered) {
+ 				ast_setstate(pvt->owner, AST_STATE_UP);
+@@ -3662,12 +5114,13 @@
+ 		pvt->needcallerid = 0;
+ 		cidinfo = hfp_parse_clip(pvt->hfp, buf);
+ 
+-		if (!(chan = mbl_new(AST_STATE_RING, pvt, &cidinfo, NULL, NULL))) {
++		if (!(chan = mbl_new(AST_STATE_RING, pvt, &cidinfo, NULL, NULL, NULL))) {
+ 			ast_log(LOG_ERROR, "[%s] unable to allocate channel for incoming call\n", pvt->id);
+ 			hfp_send_chup(pvt->hfp);
+ 			msg_queue_push(pvt, AT_OK, AT_CHUP);
+ 			return -1;
+ 		}
++		mbl_msbc_stats_begin_locked(pvt);
+ 
+ 		/* from this point on, we need to send a chup in the event of a
+ 		 * hangup */
+@@ -3752,7 +5205,7 @@
+ 		pvt->incoming_sms = 0;
+ 
+ 		/* XXX this channel probably does not need to be associated with this pvt */
+-		if (!(chan = mbl_new(AST_STATE_DOWN, pvt, NULL, NULL, NULL))) {
++		if (!(chan = mbl_new(AST_STATE_DOWN, pvt, NULL, NULL, NULL, NULL))) {
+ 			ast_debug(1, "[%s] error creating sms message channel, disconnecting\n", pvt->id);
+ 			return -1;
+ 		}
+@@ -3873,6 +5326,7 @@
+ {
+ 	struct mbl_pvt *pvt = (struct mbl_pvt *)data;
+ 	struct hfp_pvt *hfp = pvt->hfp;
++	struct hfp_hf our_brsf = hfp_our_brsf;
+ 	char buf[350];
+ 	int t;
+ 	at_message_t at_msg;
+@@ -3886,8 +5340,15 @@
+ 
+ 	/* start initialization with the BRSF request */
+ 	ast_mutex_lock(&pvt->lock);
++	hfp->initialized = 0;
++	pvt->audio_codec = MBL_AUDIO_CVSD;
++	pvt->wideband_capable = 0;
++	cm_msbc_tx_packetizer_reset(&pvt->msbc_tx);
++	pvt->cvsd_carry_valid = 0;
++	our_brsf.codec = pvt->wideband_requested;
++	our_brsf.esco = pvt->wideband_requested;
+ 	pvt->timeout = 10000;
+-	if (hfp_send_brsf(hfp, &hfp_our_brsf)  || msg_queue_push(pvt, AT_BRSF, AT_BRSF)) {
++	if (hfp_send_brsf(hfp, &our_brsf)  || msg_queue_push(pvt, AT_BRSF, AT_BRSF)) {
+ 		ast_debug(1, "[%s] error sending BRSF\n", hfp->owner->id);
+ 		goto e_cleanup;
+ 	}
+@@ -3942,6 +5403,14 @@
+ 			}
+ 			ast_mutex_unlock(&pvt->lock);
+ 			break;
++		case AT_BCS:
++			ast_mutex_lock(&pvt->lock);
++			if (handle_response_bcs(pvt, buf)) {
++				ast_mutex_unlock(&pvt->lock);
++				goto e_cleanup;
++			}
++			ast_mutex_unlock(&pvt->lock);
++			break;
+ 		case AT_CIND:
+ 			ast_mutex_lock(&pvt->lock);
+ 			if (handle_response_cind(pvt, buf)) {
+@@ -4077,6 +5546,7 @@
+ 		ast_verb(3, "Error initializing Bluetooth device %s.\n", pvt->id);
+ 
+ 	ast_mutex_lock(&pvt->lock);
++	mbl_msbc_stats_report_locked(pvt, MBL_MSBC_STATS_RFCOMM_DISCONNECT);
+ 	if (pvt->owner) {
+ 		ast_debug(1, "[%s] device disconnected, hanging up owner\n", pvt->id);
+ 		pvt->needchup = 0;
+@@ -4204,7 +5674,7 @@
+ 
+ 				pvt->incoming = 1;
+ 
+-				if (!(chan = mbl_new(AST_STATE_UP, pvt, NULL, NULL, NULL))) {
++				if (!(chan = mbl_new(AST_STATE_UP, pvt, NULL, NULL, NULL, NULL))) {
+ 					ast_log(LOG_ERROR, "[%s] unable to allocate channel for incoming call\n", pvt->id);
+ 					ast_mutex_unlock(&pvt->lock);
+ 					goto e_cleanup;
+@@ -4294,7 +5764,9 @@
+ 				AST_RWLIST_RDLOCK(&devices);
+ 				AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
+ 					ast_mutex_lock(&pvt->lock);
+-					if (!adapter->inuse && !pvt->connected && !strcmp(adapter->id, pvt->adapter->id)) {
++					if (pvt->call_control != MBL_CALL_CONTROL_LE_GTBS &&
++						!adapter->inuse && !pvt->connected &&
++						!strcmp(adapter->id, pvt->adapter->id)) {
+ 						if ((pvt->rfcomm_socket = rfcomm_connect(adapter->addr, pvt->addr, pvt->rfcomm_port)) > -1) {
+ 							if (start_monitor(pvt)) {
+ 								pvt->connected = 1;
+@@ -4347,6 +5819,554 @@
+ 	return NULL;
+ }
+ 
++static void mbl_leaudio_dispatch(struct cm_le_descriptor *descriptor,
++	int media_fd, int lifecycle_fd)
++{
++	struct mbl_pvt *pvt;
++	int matched = 0;
++
++	AST_RWLIST_RDLOCK(&devices);
++	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
++		char address[18];
++		int result;
++		int installed = 0;
++
++		if (pvt->audio_transport != MBL_AUDIO_TRANSPORT_LE_CANARY)
++			continue;
++		ba2str(&pvt->addr, address);
++		if (!cm_le_descriptor_matches_address(descriptor, address))
++			continue;
++		matched = 1;
++		ast_mutex_lock(&pvt->lock);
++		if (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS &&
++			(!descriptor->call_control_correlated ||
++			 (pvt->lecall_token != 0 &&
++			  descriptor->call_control_token != pvt->lecall_token))) {
++			result = -ESTALE;
++		} else if (pvt->owner &&
++			pvt->call_control != MBL_CALL_CONTROL_LE_GTBS) {
++			result = -EBUSY;
++		} else {
++			result = cm_leaudio_install_with_lifecycle(&pvt->leaudio,
++				descriptor, media_fd, lifecycle_fd);
++			if (result == 0) {
++				installed = 1;
++				media_fd = -1;
++				lifecycle_fd = -1;
++				if (pvt->owner && pvt->lecall_token != 0 &&
++					cm_leaudio_ready(&pvt->leaudio))
++					result = mbl_leaudio_activate_locked(pvt);
++			}
++		}
++		ast_mutex_unlock(&pvt->lock);
++		if (installed) {
++			ast_log(LOG_NOTICE,
++				"[%s] staged LE Audio direction=%u rate=%u frame-us=%u generation=%" PRIu64 " bundle=%" PRIu64 " cig=%u cis=%u call-correlated=%u\n",
++				pvt->id, (unsigned int) descriptor->direction,
++				descriptor->sample_rate, descriptor->frame_duration_us,
++				descriptor->generation, descriptor->bundle_id,
++				(unsigned int) descriptor->cig,
++				(unsigned int) descriptor->cis,
++				(unsigned int) descriptor->call_control_correlated);
++			if (result < 0)
++				ast_log(LOG_WARNING,
++					"[%s] correlated LE Audio activation failed without changing call state: %s\n",
++					pvt->id, strerror(-result));
++		} else {
++			ast_log(LOG_WARNING,
++				"[%s] discarded LE Audio media descriptor without changing call state: %s\n",
++				pvt->id, strerror(-result));
++		}
++		break;
++	}
++	AST_RWLIST_UNLOCK(&devices);
++	if (!matched)
++		ast_log(LOG_WARNING,
++			"discarded LE Audio descriptor for an unconfigured device\n");
++	if (media_fd >= 0)
++		close(media_fd);
++	if (lifecycle_fd >= 0)
++		close(lifecycle_fd);
++}
++
++static void mbl_leaudio_reset_staged_all(void)
++{
++	struct mbl_pvt *pvt;
++
++	AST_RWLIST_RDLOCK(&devices);
++	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
++		if (pvt->audio_transport != MBL_AUDIO_TRANSPORT_LE_CANARY)
++			continue;
++		ast_mutex_lock(&pvt->lock);
++		cm_leaudio_reset_staged(&pvt->leaudio);
++		ast_mutex_unlock(&pvt->lock);
++	}
++	AST_RWLIST_UNLOCK(&devices);
++}
++
++static void mbl_leaudio_disconnect(int *handoff_fd)
++{
++	if (!handoff_fd || *handoff_fd < 0)
++		return;
++	close(*handoff_fd);
++	*handoff_fd = -1;
++	/* A successfully started call owns both media descriptors independently.
++	 * Only an incomplete, not-yet-active pair is discarded here. */
++	mbl_leaudio_reset_staged_all();
++}
++
++static void *do_leaudio_handoff(void *data)
++{
++	int handoff_fd = -1;
++
++	(void) data;
++	while (!check_unloading()) {
++		struct pollfd wait_fd;
++		int ready;
++
++		if (handoff_fd < 0) {
++			handoff_fd = cm_le_handoff_connect(leaudio_socket_path);
++			if (handoff_fd < 0) {
++				sleep(1);
++				continue;
++			}
++			ast_log(LOG_NOTICE,
++				"LE Audio handoff connected policy=le-canary\n");
++		}
++		memset(&wait_fd, 0, sizeof(wait_fd));
++		wait_fd.fd = handoff_fd;
++		wait_fd.events = POLLIN;
++		ready = poll(&wait_fd, 1, 1000);
++		if (ready < 0) {
++			if (errno == EINTR)
++				continue;
++			mbl_leaudio_disconnect(&handoff_fd);
++			continue;
++		}
++		if (ready == 0)
++			continue;
++		if (wait_fd.revents & POLLIN) {
++			for (;;) {
++				struct cm_le_descriptor descriptor;
++				int media_fd = -1;
++				int lifecycle_fd = -1;
++				int result = cm_le_handoff_receive(handoff_fd,
++					&descriptor, &media_fd, &lifecycle_fd);
++
++				if (result == -EAGAIN || result == -EWOULDBLOCK)
++					break;
++				if (result < 0) {
++					mbl_leaudio_disconnect(&handoff_fd);
++					break;
++				}
++				mbl_leaudio_dispatch(&descriptor, media_fd, lifecycle_fd);
++			}
++		}
++		if (handoff_fd >= 0 &&
++			(wait_fd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
++			mbl_leaudio_disconnect(&handoff_fd);
++		}
++	}
++	mbl_leaudio_disconnect(&handoff_fd);
++	return NULL;
++}
++
++static void mbl_lecall_reset_build_locked(struct mbl_pvt *pvt)
++{
++	pvt->lecall_build_sequence = 0;
++	pvt->lecall_build_token = 0;
++	pvt->lecall_build_index = 0;
++	pvt->lecall_build_state = 0;
++	pvt->lecall_build_flags = 0;
++	pvt->lecall_build_has_call = 0;
++	pvt->lecall_build_ambiguous = 0;
++}
++
++/* The caller holds pvt->lock. Losing the GTBS control path tears down only
++ * the local Asterisk channel and LC3 descriptors. It deliberately sends no
++ * Accept or Terminate command to the phone. */
++static void mbl_lecall_set_ready_locked(struct mbl_pvt *pvt, int ready,
++	const char *reason)
++{
++	int was_ready = pvt->lecall_ready;
++	int had_owner = pvt->owner != NULL;
++
++	pvt->lecall_ready = ready != 0;
++	if (pvt->lecall_ready) {
++		if (!was_ready)
++			ast_log(LOG_NOTICE, "[%s] LE GTBS readiness=ready\n", pvt->id);
++		return;
++	}
++
++	pvt->lecall_pending_sequence = 0;
++	pvt->lecall_pending_opcode = 0;
++	pvt->lecall_snapshot_sequence = 0;
++	mbl_lecall_reset_build_locked(pvt);
++	if (pvt->lecall_token != 0)
++		pvt->lecall_suppressed_token = pvt->lecall_token;
++	pvt->lecall_token = 0;
++	pvt->lecall_index = 0;
++	pvt->lecall_state = CM_LE_CALL_NO_STATE;
++	pvt->lecall_flags = 0;
++	pvt->needchup = 0;
++	pvt->lecall_remote_ended = had_owner;
++	mbl_leaudio_stop_locked(pvt, had_owner ?
++		MBL_CALL_AUDIO_LE_FAILED : MBL_CALL_AUDIO_LE_PENDING);
++	if (had_owner)
++		mbl_queue_hangup(pvt);
++	if (was_ready || had_owner)
++		ast_log(LOG_WARNING,
++			"[%s] LE GTBS readiness=unavailable local_channel=%s reason=%s\n",
++			pvt->id, had_owner ? "released" : "none",
++			reason ? reason : "unspecified");
++}
++
++static void mbl_lecall_start_incoming_locked(struct mbl_pvt *pvt)
++{
++	struct ast_channel *channel;
++
++	if (pvt->owner || pvt->lecall_token == 0 ||
++		pvt->lecall_token == pvt->lecall_suppressed_token)
++		return;
++	pvt->incoming = 1;
++	pvt->outgoing = 0;
++	pvt->needchup = 0;
++	channel = mbl_new(AST_STATE_RING, pvt, NULL, NULL, NULL, NULL);
++	if (!channel) {
++		ast_log(LOG_ERROR,
++			"[%s] unable to allocate channel for GTBS incoming call\n",
++			pvt->id);
++		pvt->lecall_suppressed_token = pvt->lecall_token;
++		return;
++	}
++	ast_channel_exten_set(channel, "s");
++	if (ast_pbx_start(channel)) {
++		ast_log(LOG_ERROR,
++			"[%s] unable to start PBX for GTBS incoming call\n",
++			pvt->id);
++		pvt->lecall_suppressed_token = pvt->lecall_token;
++		mbl_queue_hangup(pvt);
++		return;
++	}
++	ast_log(LOG_NOTICE,
++		"[%s] routed one GTBS incoming call without caller URI exposure token=%" PRIu64 "\n",
++		pvt->id, pvt->lecall_token);
++}
++
++/* The caller holds pvt->lock and has received one complete snapshot. */
++static void mbl_lecall_commit_locked(struct mbl_pvt *pvt)
++{
++	uint64_t old_token = pvt->lecall_token;
++	uint64_t sequence = pvt->lecall_build_sequence;
++
++	if (pvt->lecall_build_ambiguous) {
++		ast_log(LOG_WARNING,
++			"[%s] multiple GTBS calls are present; refusing call and media correlation\n",
++			pvt->id);
++		pvt->lecall_token = 0;
++		pvt->lecall_index = 0;
++		pvt->lecall_state = CM_LE_CALL_NO_STATE;
++		pvt->lecall_flags = 0;
++		pvt->needchup = 0;
++		pvt->lecall_remote_ended = pvt->owner != NULL;
++		mbl_leaudio_stop_locked(pvt, pvt->owner ?
++			MBL_CALL_AUDIO_LE_FAILED : MBL_CALL_AUDIO_LE_PENDING);
++		if (pvt->owner)
++			mbl_queue_hangup(pvt);
++		pvt->lecall_snapshot_sequence = sequence;
++		mbl_lecall_reset_build_locked(pvt);
++		return;
++	}
++
++	if (!pvt->lecall_build_has_call) {
++		pvt->lecall_token = 0;
++		pvt->lecall_index = 0;
++		pvt->lecall_state = CM_LE_CALL_NO_STATE;
++		pvt->lecall_flags = 0;
++		pvt->lecall_suppressed_token = 0;
++		if (old_token != 0 || !pvt->owner)
++			mbl_leaudio_stop_locked(pvt, old_token != 0 ?
++				MBL_CALL_AUDIO_LE_FAILED : MBL_CALL_AUDIO_LE_PENDING);
++		if (old_token != 0) {
++			pvt->needchup = 0;
++			pvt->lecall_remote_ended = 1;
++			if (pvt->owner)
++				mbl_queue_hangup(pvt);
++		}
++		pvt->lecall_snapshot_sequence = sequence;
++		mbl_lecall_reset_build_locked(pvt);
++		return;
++	}
++
++	if (pvt->owner && old_token == 0 &&
++		!(pvt->lecall_build_flags & CM_LE_CALL_FLAG_OUTGOING)) {
++		ast_log(LOG_WARNING,
++			"[%s] an unrelated incoming GTBS call appeared while an outbound channel was reserved; failing closed\n",
++			pvt->id);
++		pvt->lecall_suppressed_token = pvt->lecall_build_token;
++		pvt->lecall_token = 0;
++		pvt->lecall_index = 0;
++		pvt->needchup = 0;
++		pvt->lecall_remote_ended = 1;
++		mbl_leaudio_stop_locked(pvt, MBL_CALL_AUDIO_LE_FAILED);
++		mbl_queue_hangup(pvt);
++		pvt->lecall_snapshot_sequence = sequence;
++		mbl_lecall_reset_build_locked(pvt);
++		return;
++	}
++
++	if (old_token != 0 && old_token != pvt->lecall_build_token &&
++		pvt->owner) {
++		ast_log(LOG_WARNING,
++			"[%s] GTBS call token changed while a channel was active; failing closed\n",
++			pvt->id);
++		pvt->lecall_suppressed_token = pvt->lecall_build_token;
++		pvt->lecall_token = 0;
++		pvt->lecall_index = 0;
++		pvt->needchup = 0;
++		pvt->lecall_remote_ended = 1;
++		mbl_leaudio_stop_locked(pvt, MBL_CALL_AUDIO_LE_FAILED);
++		mbl_queue_hangup(pvt);
++		pvt->lecall_snapshot_sequence = sequence;
++		mbl_lecall_reset_build_locked(pvt);
++		return;
++	}
++
++	pvt->lecall_token = pvt->lecall_build_token;
++	pvt->lecall_index = pvt->lecall_build_index;
++	pvt->lecall_state = pvt->lecall_build_state;
++	pvt->lecall_flags = pvt->lecall_build_flags;
++	pvt->lecall_snapshot_sequence = sequence;
++	pvt->lecall_remote_ended = 0;
++
++	if (!pvt->owner &&
++		pvt->lecall_state == CM_LE_CALL_STATE_INCOMING &&
++		!(pvt->lecall_flags & CM_LE_CALL_FLAG_OUTGOING)) {
++		mbl_lecall_start_incoming_locked(pvt);
++	} else if (pvt->owner) {
++		switch (pvt->lecall_state) {
++		case CM_LE_CALL_STATE_DIALING:
++			mbl_queue_control(pvt, AST_CONTROL_PROGRESS);
++			break;
++		case CM_LE_CALL_STATE_ALERTING:
++			mbl_queue_control(pvt, AST_CONTROL_RINGING);
++			break;
++		case CM_LE_CALL_STATE_ACTIVE:
++			if (!pvt->answered)
++				mbl_queue_control(pvt, AST_CONTROL_ANSWER);
++			pvt->answered = 1;
++			break;
++		default:
++			break;
++		}
++		if (pvt->call_audio_transport != MBL_CALL_AUDIO_LE &&
++			cm_leaudio_ready(&pvt->leaudio) &&
++			mbl_leaudio_activate_locked(pvt) < 0)
++			ast_log(LOG_WARNING,
++				"[%s] staged ISO pair could not be activated for the GTBS token\n",
++				pvt->id);
++	}
++	mbl_lecall_reset_build_locked(pvt);
++}
++
++static struct mbl_pvt *mbl_lecall_find_device(const char *device)
++{
++	struct mbl_pvt *pvt;
++
++	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
++		char address[18];
++
++		if (pvt->call_control != MBL_CALL_CONTROL_LE_GTBS)
++			continue;
++		ba2str(&pvt->addr, address);
++		if (cm_le_call_device_equal(device, address))
++			return pvt;
++	}
++	return NULL;
++}
++
++static void mbl_lecall_dispatch(const struct cm_le_call_message *message)
++{
++	struct mbl_pvt *pvt;
++
++	AST_RWLIST_RDLOCK(&devices);
++	pvt = mbl_lecall_find_device(message->device);
++	if (!pvt) {
++		AST_RWLIST_UNLOCK(&devices);
++		ast_log(LOG_WARNING,
++			"discarded GTBS packet for an unconfigured device\n");
++		return;
++	}
++	ast_mutex_lock(&pvt->lock);
++	switch (message->type) {
++	case CM_LE_CALL_READY:
++		mbl_lecall_set_ready_locked(pvt, message->code == 1,
++			message->code == 1 ? "phone GTBS ready" :
++			"phone GTBS unavailable");
++		break;
++	case CM_LE_CALL_STATE:
++		if (pvt->lecall_build_sequence != message->sequence) {
++			if ((pvt->lecall_build_sequence != 0 &&
++				 message->sequence < pvt->lecall_build_sequence) ||
++				(pvt->lecall_snapshot_sequence != 0 &&
++				 message->sequence <= pvt->lecall_snapshot_sequence)) {
++				ast_log(LOG_WARNING,
++					"[%s] discarded stale GTBS snapshot sequence=%" PRIu64 " last=%" PRIu64 "\n",
++					pvt->id, message->sequence,
++					pvt->lecall_snapshot_sequence);
++				break;
++			}
++			mbl_lecall_reset_build_locked(pvt);
++			pvt->lecall_build_sequence = message->sequence;
++		}
++		if (message->code == CM_LE_CALL_NO_STATE) {
++			if (pvt->lecall_build_has_call)
++				pvt->lecall_build_ambiguous = 1;
++		} else if (pvt->lecall_build_has_call) {
++			pvt->lecall_build_ambiguous = 1;
++		} else {
++			pvt->lecall_build_has_call = 1;
++			pvt->lecall_build_token = message->token;
++			pvt->lecall_build_index = message->index;
++			pvt->lecall_build_state = message->code;
++			pvt->lecall_build_flags = message->value;
++		}
++		if (message->flags & CM_LE_CALL_FLAG_LAST)
++			mbl_lecall_commit_locked(pvt);
++		break;
++	case CM_LE_CALL_ACK:
++		if (message->sequence == pvt->lecall_pending_sequence &&
++			message->code == pvt->lecall_pending_opcode &&
++			(message->code == CM_LE_CALL_ORIGINATE ||
++			 (message->token == pvt->lecall_token &&
++			  message->index == pvt->lecall_index))) {
++			pvt->lecall_pending_sequence = 0;
++			if (message->value != CM_LE_CALL_ACK_ACCEPTED) {
++				ast_log(LOG_WARNING,
++					"[%s] GTBS command opcode=%u rejected before phone result code=%u\n",
++					pvt->id, (unsigned int) message->code,
++					(unsigned int) message->value);
++				if (message->code == CM_LE_CALL_ACCEPT ||
++					message->code == CM_LE_CALL_ORIGINATE) {
++					pvt->lecall_local_answer_requested = 0;
++					pvt->needchup = 0;
++				}
++				if (pvt->owner &&
++					(message->code == CM_LE_CALL_ACCEPT ||
++					 message->code == CM_LE_CALL_ORIGINATE))
++					mbl_queue_hangup(pvt);
++			}
++		}
++		break;
++	case CM_LE_CALL_RESULT:
++		if (message->value != 0 && pvt->owner &&
++			(message->token == pvt->lecall_token ||
++			 message->code == CM_LE_CALL_ORIGINATE)) {
++			ast_log(LOG_WARNING,
++				"[%s] phone rejected GTBS opcode=%u result=%u\n",
++				pvt->id, (unsigned int) message->code,
++				(unsigned int) message->value);
++			if (message->code == CM_LE_CALL_ACCEPT ||
++				message->code == CM_LE_CALL_ORIGINATE) {
++				pvt->lecall_local_answer_requested = 0;
++				pvt->needchup = 0;
++			}
++			if (message->code == CM_LE_CALL_ACCEPT ||
++				message->code == CM_LE_CALL_ORIGINATE)
++				mbl_queue_hangup(pvt);
++		}
++		break;
++	default:
++		break;
++	}
++	ast_mutex_unlock(&pvt->lock);
++	AST_RWLIST_UNLOCK(&devices);
++}
++
++static void mbl_lecall_set_ready_all(int ready, const char *reason)
++{
++	struct mbl_pvt *pvt;
++
++	AST_RWLIST_RDLOCK(&devices);
++	AST_RWLIST_TRAVERSE(&devices, pvt, entry) {
++		if (pvt->call_control != MBL_CALL_CONTROL_LE_GTBS)
++			continue;
++		ast_mutex_lock(&pvt->lock);
++		mbl_lecall_set_ready_locked(pvt, ready, reason);
++		ast_mutex_unlock(&pvt->lock);
++	}
++	AST_RWLIST_UNLOCK(&devices);
++}
++
++static void mbl_lecall_disconnect(int *socket_fd)
++{
++	if (!socket_fd || *socket_fd < 0)
++		return;
++	ast_mutex_lock(&lecall_socket_mutex);
++	if (lecall_socket == *socket_fd)
++		lecall_socket = -1;
++	close(*socket_fd);
++	*socket_fd = -1;
++	ast_mutex_unlock(&lecall_socket_mutex);
++	mbl_lecall_set_ready_all(0, "call-control socket disconnected");
++}
++
++static void *do_lecall_control(void *data)
++{
++	int socket_fd = -1;
++
++	(void) data;
++	while (!check_unloading()) {
++		struct pollfd wait_fd;
++		int ready;
++
++		if (socket_fd < 0) {
++			socket_fd = cm_le_call_connect(lecall_socket_path);
++			if (socket_fd < 0) {
++				sleep(1);
++				continue;
++			}
++			ast_mutex_lock(&lecall_socket_mutex);
++			lecall_socket = socket_fd;
++			ast_mutex_unlock(&lecall_socket_mutex);
++			mbl_lecall_set_ready_all(0, "call-control socket connected");
++			ast_log(LOG_NOTICE,
++				"LE GTBS call-control socket connected\n");
++		}
++		memset(&wait_fd, 0, sizeof(wait_fd));
++		wait_fd.fd = socket_fd;
++		wait_fd.events = POLLIN;
++		ready = poll(&wait_fd, 1, 1000);
++		if (ready < 0) {
++			if (errno == EINTR)
++				continue;
++			mbl_lecall_disconnect(&socket_fd);
++			continue;
++		}
++		if (ready == 0)
++			continue;
++		if (wait_fd.revents & POLLIN) {
++			for (;;) {
++				struct cm_le_call_message message;
++				int result = cm_le_call_receive(socket_fd, &message);
++
++				if (result == -EAGAIN || result == -EWOULDBLOCK)
++					break;
++				if (result < 0) {
++					mbl_lecall_disconnect(&socket_fd);
++					break;
++				}
++				mbl_lecall_dispatch(&message);
++			}
++		}
++		if (socket_fd >= 0 &&
++			(wait_fd.revents & (POLLERR | POLLHUP | POLLNVAL)))
++			mbl_lecall_disconnect(&socket_fd);
++	}
++	mbl_lecall_disconnect(&socket_fd);
++	return NULL;
++}
++
+ /*
+ 
+ 	Module
+@@ -4366,9 +6386,14 @@
+ static struct adapter_pvt *mbl_load_adapter(struct ast_config *cfg, const char *cat)
+ {
+ 	const char *id, *address;
++	const char *device_cat;
+ 	struct adapter_pvt *adapter;
+ 	struct ast_variable *v;
+ 	struct hci_dev_req dr;
++	struct hci_dev_info dev_info;
++	struct hci_version version;
++	unsigned int version_attempt;
++	int version_read = 0;
+ 	uint16_t vs;
+ 
+ 	id = ast_variable_retrieve(cfg, cat, "id");
+@@ -4389,6 +6414,28 @@
+ 	ast_copy_string(adapter->id, id, sizeof(adapter->id));
+ 	str2ba(address, &adapter->addr);
+ 
++	/* The listener must enable deferred setup before bind/listen. Pre-scan
++	 * device sections for an explicit Wideband Speech request. */
++	for (device_cat = ast_category_browse(cfg, NULL); device_cat;
++		device_cat = ast_category_browse(cfg, device_cat)) {
++		const char *device_adapter;
++		const char *wideband;
++		const char *type;
++
++		if (!strcasecmp(device_cat, "general") ||
++			!strcasecmp(device_cat, "adapter"))
++			continue;
++		device_adapter = ast_variable_retrieve(cfg, device_cat, "adapter");
++		wideband = ast_variable_retrieve(cfg, device_cat, "widebandspeech");
++		type = ast_variable_retrieve(cfg, device_cat, "type");
++		if (!ast_strlen_zero(device_adapter) && !strcmp(device_adapter, id) &&
++			!ast_strlen_zero(wideband) && ast_true(wideband) &&
++			(ast_strlen_zero(type) || strcasecmp(type, "headset"))) {
++			adapter->deferred_setup = 1;
++			break;
++		}
++	}
++
+ 	/* attempt to connect to the adapter */
+ 	adapter->dev_id = hci_devid(address);
+ 	adapter->hci_socket = hci_open_dev(adapter->dev_id);
+@@ -4397,8 +6444,39 @@
+ 		goto e_free_adapter;
+ 	}
+ 
++	memset(&dev_info, 0, sizeof(dev_info));
++	dev_info.dev_id = adapter->dev_id;
++	if (hci_devinfo(adapter->dev_id, &dev_info) == 0) {
++		adapter->usb_transport = (dev_info.type & 0x0f) == HCI_USB;
++		adapter->controller_sco_mtu = dev_info.sco_mtu;
++	}
++	for (version_attempt = 0; version_attempt < 3; ++version_attempt) {
++		memset(&version, 0, sizeof(version));
++		if (hci_read_local_version(adapter->hci_socket, &version, 1000) == 0) {
++			version_read = 1;
++			break;
++		}
++	}
++	if (version_read) {
++		adapter->realtek = version.manufacturer == BT_COMPID_REALTEK;
++		adapter->mediatek = version.manufacturer == BT_COMPID_MEDIATEK;
++		ast_log(LOG_NOTICE,
++			"Adapter %s HCI bus=%s manufacturer=0x%04x MediaTek=%s\n",
++			adapter->id, adapter->usb_transport ? "USB" : "non-USB",
++			version.manufacturer, adapter->mediatek ? "yes" : "no");
++	} else {
++		ast_log(LOG_WARNING,
++			"Adapter %s could not read HCI manufacturer after 3 attempts\n",
++			adapter->id);
++	}
++
+ 	/* check voice setting */
+-	hci_read_voice_setting(adapter->hci_socket, &vs, 1000);
++	if (hci_read_voice_setting(adapter->hci_socket, &vs, 1000) < 0) {
++		ast_log(LOG_ERROR,
++			"Skipping adapter %s. Unable to read HCI voice setting.\n",
++			adapter->id);
++		goto e_hci_close_dev;
++	}
+ 	vs = htobs(vs);
+ 	if (vs != 0x0060) {
+ 		ast_log(LOG_ERROR, "Skipping adapter %s. Voice setting must be 0x0060 - see 'man hciconfig' for details.\n", adapter->id);
+@@ -4524,6 +6602,12 @@
+ 	/* set some defaults */
+ 
+ 	pvt->type = MBL_TYPE_PHONE;
++	pvt->audio_codec = MBL_AUDIO_CVSD;
++	pvt->audio_transport = MBL_AUDIO_TRANSPORT_CLASSIC;
++	pvt->call_audio_transport = MBL_CALL_AUDIO_CLASSIC;
++	pvt->call_control = MBL_CALL_CONTROL_CLASSIC;
++	pvt->lecall_state = CM_LE_CALL_NO_STATE;
++	cm_leaudio_init(&pvt->leaudio);
+ 	ast_copy_string(pvt->context, "default", sizeof(pvt->context));
+ 
+ 	/* populate the pvt structure */
+@@ -4539,13 +6623,13 @@
+ 	pvt->has_sms = 1;
+ 
+ 	/* setup the bt_out_smoother */
+-	if (!(pvt->bt_out_smoother = ast_smoother_new(DEVICE_FRAME_SIZE))) {
++	if (!(pvt->bt_out_smoother = ast_smoother_new(CVSD_DEVICE_FRAME_SIZE))) {
+ 		ast_log(LOG_ERROR, "Skipping device %s. Error setting up frame bt_out_smoother.\n", cat);
+ 		goto e_free_pvt;
+ 	}
+ 
+ 	/* setup the bt_in_smoother */
+-	if (!(pvt->bt_in_smoother = ast_smoother_new(CHANNEL_FRAME_SIZE))) {
++	if (!(pvt->bt_in_smoother = ast_smoother_new(CVSD_CHANNEL_FRAME_SIZE))) {
+ 		ast_log(LOG_ERROR, "Skipping device %s. Error setting up frame bt_in_smoother.\n", cat);
+ 		goto e_free_bt_out_smoother;
+ 	}
+@@ -4578,6 +6662,24 @@
+ 			pvt->group = atoi(v->value);
+ 		} else if (!strcasecmp(v->name, "sms")) {
+ 			pvt->has_sms = ast_true(v->value);
++		} else if (!strcasecmp(v->name, "widebandspeech")) {
++			pvt->wideband_requested = ast_true(v->value);
++		} else if (!strcasecmp(v->name, "audiotransport")) {
++			if (!strcasecmp(v->value, "le-canary")) {
++				pvt->audio_transport = MBL_AUDIO_TRANSPORT_LE_CANARY;
++			} else if (strcasecmp(v->value, "classic")) {
++				ast_log(LOG_WARNING,
++					"Device %s has unknown audiotransport '%s'; using classic\n",
++					pvt->id, v->value);
++			}
++		} else if (!strcasecmp(v->name, "callcontrol")) {
++			if (!strcasecmp(v->value, "le-gtbs")) {
++				pvt->call_control = MBL_CALL_CONTROL_LE_GTBS;
++			} else if (strcasecmp(v->value, "classic")) {
++				ast_log(LOG_WARNING,
++					"Device %s has unknown callcontrol '%s'; using classic\n",
++					pvt->id, v->value);
++			}
+ 		} else if (!strcasecmp(v->name, "nocallsetup")) {
+ 			pvt->no_callsetup = ast_true(v->value);
+ 
+@@ -4588,6 +6690,56 @@
+ 			pvt->has_sms = 0;
+ 		}
+ 	}
++	if (pvt->call_control == MBL_CALL_CONTROL_LE_GTBS) {
++		if (pvt->type != MBL_TYPE_PHONE) {
++			ast_log(LOG_WARNING,
++				"Device %s is a headset; ignoring LE GTBS call control\n",
++				pvt->id);
++			pvt->call_control = MBL_CALL_CONTROL_CLASSIC;
++		} else {
++			pvt->audio_transport = MBL_AUDIO_TRANSPORT_LE_CANARY;
++			pvt->wideband_requested = 0;
++			pvt->has_sms = 0;
++			lecall_enabled = 1;
++			leaudio_enabled = 1;
++			ast_log(LOG_NOTICE,
++				"Device %s enables default-off GTBS control with correlated LE Audio and no SMS path\n",
++				pvt->id);
++		}
++	}
++	if (pvt->audio_transport == MBL_AUDIO_TRANSPORT_LE_CANARY) {
++		if (pvt->type != MBL_TYPE_PHONE) {
++			ast_log(LOG_WARNING,
++				"Device %s is a headset; ignoring LE Audio canary transport\n",
++				pvt->id);
++			pvt->audio_transport = MBL_AUDIO_TRANSPORT_CLASSIC;
++		} else {
++			leaudio_enabled = 1;
++			ast_log(LOG_NOTICE,
++				"Device %s permits the default-off LE Audio canary media path\n",
++				pvt->id);
++		}
++	}
++
++	if (pvt->wideband_requested) {
++		if (pvt->type != MBL_TYPE_PHONE) {
++			ast_log(LOG_WARNING, "Device %s is a headset; ignoring widebandspeech\n",
++				pvt->id);
++			pvt->wideband_requested = 0;
++		} else if (!pvt->adapter->deferred_setup) {
++			ast_log(LOG_WARNING, "Device %s cannot use widebandspeech because "
++				"BT_DEFER_SETUP is unavailable\n", pvt->id);
++			pvt->wideband_requested = 0;
++		} else if (cm_msbc_init(&pvt->msbc) < 0) {
++			ast_log(LOG_WARNING, "Device %s cannot initialize mSBC; using CVSD\n",
++				pvt->id);
++			pvt->wideband_requested = 0;
++		} else {
++			pvt->msbc_initialized = 1;
++			ast_log(LOG_NOTICE, "Device %s requests HFP Wideband Speech (mSBC)\n",
++				pvt->id);
++		}
++	}
+ 
+ 	if (pvt->type == MBL_TYPE_PHONE) {
+ 		if (!(pvt->hfp = ast_calloc(1, sizeof(*pvt->hfp)))) {
+@@ -4610,6 +6762,8 @@
+ 	return pvt;
+ 
+ e_free_sched:
++	if (pvt->msbc_initialized)
++		cm_msbc_finish(&pvt->msbc);
+ 	ast_sched_context_destroy(pvt->sched);
+ e_free_dsp:
+ 	ast_dsp_free(pvt->dsp);
+@@ -4618,6 +6772,7 @@
+ e_free_bt_out_smoother:
+ 	ast_smoother_free(pvt->bt_out_smoother);
+ e_free_pvt:
++	cm_leaudio_end(&pvt->leaudio);
+ 	ast_free(pvt);
+ e_return:
+ 	return NULL;
+@@ -4643,6 +6798,26 @@
+ 			if (!sscanf(v->value, "%d", &discovery_interval)) {
+ 				ast_log(LOG_NOTICE, "error parsing 'interval' in general section, using default value\n");
+ 			}
++		} else if (!strcasecmp(v->name, "leaudiosocket")) {
++			if (v->value[0] != '/' ||
++				strlen(v->value) > MBL_LE_AUDIO_SOCKET_MAX) {
++				ast_log(LOG_WARNING,
++					"invalid leaudiosocket; retaining %s\n",
++					leaudio_socket_path);
++			} else {
++				ast_copy_string(leaudio_socket_path, v->value,
++					sizeof(leaudio_socket_path));
++			}
++		} else if (!strcasecmp(v->name, "lecallsocket")) {
++			if (v->value[0] != '/' ||
++				strlen(v->value) > CM_LE_CALL_SOCKET_MAX) {
++				ast_log(LOG_WARNING,
++					"invalid lecallsocket; retaining %s\n",
++					lecall_socket_path);
++			} else {
++				ast_copy_string(lecall_socket_path, v->value,
++					sizeof(lecall_socket_path));
++			}
+ 		}
+ 	}
+ 
+@@ -4722,6 +6897,16 @@
+ 		pthread_kill(discovery_thread, SIGURG);
+ 		pthread_join(discovery_thread, NULL);
+ 	}
++	if (leaudio_thread != AST_PTHREADT_NULL) {
++		pthread_kill(leaudio_thread, SIGURG);
++		pthread_join(leaudio_thread, NULL);
++		leaudio_thread = AST_PTHREADT_NULL;
++	}
++	if (lecall_thread != AST_PTHREADT_NULL) {
++		pthread_kill(lecall_thread, SIGURG);
++		pthread_join(lecall_thread, NULL);
++		lecall_thread = AST_PTHREADT_NULL;
++	}
+ 
+ 	/* stop the sco listener threads */
+ 	AST_RWLIST_WRLOCK(&adapters);
+@@ -4747,6 +6932,9 @@
+ 		if (pvt->hfp) {
+ 			ast_free(pvt->hfp);
+ 		}
++		if (pvt->msbc_initialized)
++			cm_msbc_finish(&pvt->msbc);
++		cm_leaudio_end(&pvt->leaudio);
+ 
+ 		ast_smoother_free(pvt->bt_out_smoother);
+ 		ast_smoother_free(pvt->bt_in_smoother);
+@@ -4784,7 +6972,12 @@
+ 		return AST_MODULE_LOAD_DECLINE;
+ 	}
+ 
+-	ast_format_cap_append(mbl_tech.capabilities, DEVICE_FRAME_FORMAT, 0);
++	/* Prefer signed linear at the negotiated HFP WBS rate, while retaining
++	 * the original 8 kHz CVSD capability and translator path. */
++	ast_format_cap_append(mbl_tech.capabilities, ast_format_slin16, 0);
++	ast_format_cap_append(mbl_tech.capabilities, ast_format_slin24, 0);
++	ast_format_cap_append(mbl_tech.capabilities, ast_format_slin32, 0);
++	ast_format_cap_append(mbl_tech.capabilities, ast_format_slin, 0);
+ 	/* Check if we have Bluetooth, no point loading otherwise... */
+ 	dev_id = hci_get_route(NULL);
+ 
+@@ -4807,6 +7000,18 @@
+ 	}
+ 
+ 	sdp_session = sdp_register();
++	if (lecall_enabled && ast_pthread_create_background(&lecall_thread,
++		NULL, do_lecall_control, NULL) < 0) {
++		ast_log(LOG_WARNING,
++			"Unable to create LE GTBS control thread; LE calls remain unavailable\n");
++		lecall_thread = AST_PTHREADT_NULL;
++	}
++	if (leaudio_enabled && ast_pthread_create_background(&leaudio_thread,
++		NULL, do_leaudio_handoff, NULL) < 0) {
++		ast_log(LOG_WARNING,
++			"Unable to create LE Audio handoff thread; classic media remains available\n");
++		leaudio_thread = AST_PTHREADT_NULL;
++	}
+ 
+ 	/* Spin the discovery thread */
+ 	if (ast_pthread_create_background(&discovery_thread, NULL, do_discovery, NULL) < 0) {
+--- a/addons/Makefile
++++ b/addons/Makefile
+@@ -58,6 +58,9 @@
+ include $(ASTTOPDIR)/Makefile.moddir_rules
+ 
+ chan_mobile.o: _ASTCFLAGS+=$(AST_NO_FORMAT_TRUNCATION)
++SBC_LIB?=-lsbc
++chan_mobile.so: LIBS+=$(SBC_LIB) $(LC3_LIB)
++$(call MOD_ADD_C,chan_mobile,chan_mobile_msbc.c chan_mobile_leaudio.c chan_mobile_lecall.c)
+ chan_ooh323.so: _ASTCFLAGS+=$(H323CFLAGS)
+ $(call MOD_ADD_C,chan_ooh323,$(H323SOURCE))
+ 
