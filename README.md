@@ -104,6 +104,31 @@ The connect notice is rate limited to `MBL_LE_HANDOFF_LOG_INTERVAL` and carries
 `reconnects_since_last_notice=N`.  Suppressing silently would hide exactly the
 reconnect storm worth knowing about.
 
+## Dialling during a call: the core makes the tone
+
+GTBS has no DTMF opcode.  Accept, Terminate, Hold, Retrieve, Originate and Join
+are the entire vocabulary, so on the LE path there is no way to ask the phone to
+press a key.  Classic HFP has `AT+VTS` and does not need one.  The result was
+that keypad presses did nothing on LE, which makes any IVR unreachable.
+
+Asterisk already solves this, and the driver has to ask:
+
+    if (!tech->send_digit_begin)          return 0;   /* nothing happens */
+    if (!tech->send_digit_begin(chan, d)) return 0;   /* driver handled it */
+    ast_playtones_start(chan, 0, dtmf_tones[...], 0); /* non-zero: core does it */
+
+Leaving `send_digit_begin` NULL takes the first branch, so no tone is ever
+produced.  `mbl_digit_begin` returns non-zero on a GTBS call and zero on
+classic, where `AT+VTS` still does the work.  `ast_senddigit_end` stops the tone
+when `send_digit_end` returns non-zero, which the GTBS branch already did.
+
+The tone is generated at 8 kHz and the core translates it up, so nothing here
+needs to know the LE sample rate.  It also does not strand the call at 8 kHz:
+`playtones_alloc` saves the write format and `playtones_release` restores it, so
+only the moment a key is held is narrowband, and what is narrowband then is a
+697-1633 Hz tone rather than speech.  Generating the tone by hand is the obvious
+alternative and it is the one that loses that restore.
+
 ## Caller ID over the call-control socket
 
 The `lecall` packet is a fixed 128 bytes and carries the caller identity as an

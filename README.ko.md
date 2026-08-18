@@ -107,6 +107,30 @@ connect *실패*만 막았기 때문에, 성공했다가 즉시 죽는 연결은
 `reconnects_since_last_notice=N`을 함께 싣습니다. 조용히 억제하면 정작 알아야 할
 재연결 폭주가 가려지기 때문입니다.
 
+## 통화 중 다이얼: 톤은 코어가 만듭니다
+
+GTBS에는 DTMF opcode가 없습니다. Accept, Terminate, Hold, Retrieve, Originate,
+Join이 전부라 LE 경로에서는 휴대폰에 키를 누르라고 시킬 방법이 없습니다.
+클래식 HFP는 `AT+VTS`가 있어 필요가 없었습니다. 그래서 LE에서는 키패드를 눌러도
+아무 일도 일어나지 않았고, ARS를 쓸 수 없었습니다.
+
+Asterisk가 이미 해결책을 갖고 있고, 드라이버가 요청해야 합니다.
+
+    if (!tech->send_digit_begin)          return 0;   /* 아무 일도 없음 */
+    if (!tech->send_digit_begin(chan, d)) return 0;   /* 드라이버가 처리 */
+    ast_playtones_start(chan, 0, dtmf_tones[...], 0); /* 0 아니면 코어가 생성 */
+
+`send_digit_begin`을 비워두면 첫 분기로 빠져 톤이 만들어지지 않습니다.
+`mbl_digit_begin`은 GTBS 통화에서 0이 아닌 값을, 클래식에서 0을 반환합니다.
+클래식은 `AT+VTS` 그대로입니다. `ast_senddigit_end`는 `send_digit_end`가 0이
+아닌 값을 반환할 때 톤을 멈추는데, GTBS 분기는 이미 그렇게 하고 있었습니다.
+
+톤은 8kHz로 생성되고 코어가 변환하므로, 여기서 LE 샘플레이트를 알 필요가
+없습니다. 통화가 8kHz로 남지도 않습니다. `playtones_alloc`이 쓰기 포맷을
+저장하고 `playtones_release`가 되돌리므로, 좁은 대역인 구간은 키를 누르는
+순간뿐이고 그때 실리는 것도 음성이 아니라 697~1633Hz 톤입니다. 톤을 직접
+만드는 쪽이 떠오르는 대안인데, 바로 그 복구를 놓치는 길입니다.
+
 ## 호출 제어 소켓의 발신자 정보
 
 `lecall` 패킷은 128바이트 고정이고, 발신자 정보는 통화 상태 메시지에 선택
